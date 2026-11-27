@@ -1,5 +1,8 @@
 # LuaJIT + libuv + picohttpparser + mbedTLS
 
+> 完整技术文档见 [docs/TECHNICAL.md](../docs/TECHNICAL.md)，使用/配置手册见
+> [docs/USER_MANUAL.md](../docs/USER_MANUAL.md)。本文件保留构建、测试、压测和历史实验记录。
+
 本目录只保留 picohttpparser 方案；其他 HTTP 库（纯 Lua 的 coro-http-luv / http-codec / luvit / weblit、
 C 的 llhttp、C++ 的 nekipelov/httpparser、Rust 的 httparse）及其绑定代码已删除。
 两轮历史压测数据保留在 `results*/` 下供对照。
@@ -8,21 +11,15 @@ C 的 llhttp、C++ 的 nekipelov/httpparser、Rust 的 httparse）及其绑定�
 
 - `servers/pico.lua`：最小 HTTP 服务器（luv + picohttpparser 的 LuaJIT FFI 绑定）
 - `tests/pico_probe.lua`：解析器级探针（畸形请求、UTF-8、限制）
-- `tests/pico_robust.py`：服务器级健壮性测试（raw socket）
+- `tests/pico_robust.py`：pico/luv 服务器级健壮性辅助测试（raw socket）
 - `tests/pico_utf8_resp.lua` + `tests/pico_utf8_check.py`：UTF-8 响应验证
-- `tests/*.txt`：最近一次测试输出
+- `../tests/`：当前服务器的功能回归套件（LLM/HUMAN，每个脚本独立启停服务），见 `../tests/README.md`
+- `results-tests/`：历史测试输出（probe/robust/stream/utf8）
 - `build.sh` / `run.sh` / `summarize.sh` / `bench.lua`：源码构建与 wrk 压测
 - `../src/httpd.c` + `../src/app.lua` + `../src/config.example.lua`：C 宿主服务器、业务示例、配置示例
-- `tests/config-https.lua` + `tests/tls_test.py`：HTTP/HTTPS 双 listener 配置与 TLS 功能测试
-- `tests/tls_sni_reload_test.py`：SNI 多证书、定时 st_mtime 证书检测、keepalive 定时器测试
-- `tests/config-mtls.lua` + `tests/mtls_sni_test.py`：per-SNI mTLS（不同客户端 CA / 是否要求客户端证书）
-- `tests/config-revocation.lua` + `tests/revocation_test.py`：客户端证书吊销表（mock 数据、定时刷新）
-- `tests/config-log.lua` + `tests/log_test.py`：固定 nginx 风格 access/error 日志
-- `tests/config-log-rotate.lua` + `tests/log_rotate_test.py`：日志定时切分/截断
-- `tests/config-shutdown.lua` + `tests/shutdown_test.py`：优雅退出（空闲/在飞/超时）
 - `results/`、`results-latency/`：第一轮（Lua HTTP 库）压测数据（候选已删除）
 - `results-parsers/`、`results-parsers-latency/`：第二轮（C/C++/Rust 解析器）压测数据（候选已删除）
-- `results-https-config/`：配置 + HTTPS 阶段的明文压测数据
+- `results-c*/`、`results-hello*/`、`results-https-config/`、`results-tcp-sni/`：各阶段压测数据
 - `versions.txt`、`versions-parsers.txt`、`versions-https.txt`：各阶段版本清单
 
 ## 历史结论
@@ -177,7 +174,7 @@ handle(req, res)
 
 ### 测试
 
-- `bench/tests/stream_test.py`：14 个用例全过（小/大 body 上传、chunked 下载 10 MiB、CL 分块下载 10 MiB、SSE、HTTP/1.0 close 定界、HEAD、TE 请求 400、pipeline 2/2、慢读背压、中途断开后继续服务）
+- `tests/LLM/01_http_stream_test.py`：HTTP/流式回归（小/大 body 上传、chunked 下载 10 MiB、CL 分块下载 10 MiB、SSE、HTTP/1.0 close 定界、HEAD、TE 请求 400、pipeline 2/2、慢读背压、中途断开后继续服务）
 - 健壮性回归全部通过
 - 内存：上传 32 MiB 请求体，进程 RSS 从 2.7 MB 只涨到 3.6 MB（+0.9 MB）
 
@@ -206,7 +203,7 @@ handle(req, res)
 
 ### 配置项
 
-示例见 `src/config.example.lua`，测试配置见 `bench/tests/config-https.lua`。
+示例见 `src/config.example.lua`；功能回归脚本会自动生成各自的临时配置（见 `../tests/README.md`）。
 
 - `server.listen`：数组，元素 `{ host, port, tls = true }`；支持多 listener、IPv4/IPv6、端口 0（启动日志打印实际端口）
 - `server.tls`：`cert` / `key` / `ca` / `min_version`（"1.2"|"1.3"）/ `client_auth` / `handshake_timeout` / `alpn`
@@ -356,7 +353,7 @@ TLS 检查/吊销表线程池任务不参与 drain（它们不访问 Lua，进�
 
 ### 测试
 
-`bench/tests/tls_test.py`（TLS raw socket）+ `curl -k` / `openssl s_client`：
+`tests/LLM/02_tls_https_test.py`（TLS raw socket）+ `curl -k` / `openssl s_client`：
 
 - TLS 1.2、TLS 1.3 握手成功；ALPN 协商到 `http/1.1`
 - HTTP + HTTPS 双 listener 同进程工作；旧 `app.lua` 模式兼容
@@ -369,7 +366,7 @@ TLS 检查/吊销表线程池任务不参与 drain（它们不访问 Lua，进�
 - SNI：默认 / 精确名 / `*.suffix` 通配 / 二级子域回退 / 未知名回退，5 种情况的证书 subject 均正确
 - 定时证书检测：替换默认证书后不发任何信号，等待 `check_interval`，新连接拿到新证书；
   旧 keep-alive 连接继续返回 200
-- per-SNI mTLS（`config-mtls.lua`，13 个用例）：A 域名只接受 CA-A 客户端证书、B 域名只接受 CA-B、
+- per-SNI mTLS（`tests/LLM/04_mtls_sni_test.py`，13 个用例）：A 域名只接受 CA-A 客户端证书、B 域名只接受 CA-B、
   public 覆盖为不要求、inherit 继承全局 CA、默认无 SNI 走全局策略；错误 CA / 无证书均被拒
 - 定时检测替换 CA-A 文件后，A 域名从接受 client-a 变为接受 client-b，换回后恢复
 - 吊销表（mock）：空表通过；写入 client-a 指纹后等待 `interval` → a 被拒、b/public 不受影响；
@@ -383,7 +380,7 @@ TLS 检查/吊销表线程池任务不参与 drain（它们不访问 Lua，进�
   上传卡住时 ~2.02s 超时强制退出 + exit 0
 - TCP 选项：`ss -tno` 可见 keepalive 定时器；`SO_SNDBUF/SO_RCVBUF=65536` 实际生效
   （`skmem rb/tb=131072`）；`reuse_port=true` 时两个实例同端口绑定成功，20/20 请求 200
-- 明文回归：`stream_test.py` 全过、`pico_robust.py` 全过（200/200 并发），服务器存活
+- 明文回归：`tests/LLM/01_http_stream_test.py` 全过、`bench/tests/pico_robust.py` 全过（200/200 并发），服务器存活
 
 ### 压测（wrk -t4 -c100 -d10s，明文 listener）
 

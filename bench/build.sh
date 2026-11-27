@@ -128,23 +128,62 @@ build_mbedtls() {
   ls "$PREFIX/mbedtls/lib"
 }
 
+build_curl() {
+  local ver="8.23.0"
+  local d="$SRC/curl"
+  if [ ! -f "$d/configure" ]; then
+    tarball "https://curl.se/download/curl-$ver.tar.gz" "$d"
+  fi
+  run curl-configure bash -c 'cd "$1" && ./configure --prefix="$2" \
+    --with-mbedtls="$3" \
+    --disable-shared --enable-static \
+    --disable-ldap --disable-ldaps \
+    --without-zlib --without-brotli --without-zstd --without-libpsl \
+    --without-libidn2 --without-nghttp2 --without-librtmp --without-libssh2 \
+    --without-openssl --without-gnutls --without-wolfssl --without-bearssl --without-rustls \
+    --disable-ftp --disable-file --disable-dict --disable-telnet --disable-tftp \
+    --disable-pop3 --disable-imap --disable-smtp --disable-gopher --disable-mqtt \
+    --disable-rtsp --disable-smb \
+    --disable-manual --disable-debug \
+    --enable-threaded-resolver' _ "$d" "$PREFIX/curl" "$PREFIX/mbedtls"
+  run curl-make make -C "$d" -j"$JOBS"
+  run curl-install make -C "$d" install
+  ls "$PREFIX/curl/lib"
+}
+
+gen_cdef() {
+  run cdef bash "$ROOT/tools/gen_cdef.sh"
+}
+
+gen_lua_bc() {
+  run lua-bc bash "$ROOT/tools/gen_lua_bc.sh"
+}
+
 build_c_httpd() {
   local out="$PREFIX/c-httpd/bin"
   mkdir -p "$out"
+  gen_cdef
+  if [ ! -x "$LUAJIT/bin/luajit" ]; then
+    build_luajit
+  fi
+  gen_lua_bc
   if [ ! -f "$PREFIX/mbedtls/lib/libmbedtls.a" ]; then
     build_mbedtls
+  fi
+  if [ ! -f "$PREFIX/curl/lib/libcurl.a" ]; then
+    build_curl
   fi
   run c-httpd gcc -O2 -DNDEBUG -o "$out/luajit-httpd" \
     "$ROOT/src/httpd.c" "$SRC/picohttpparser/picohttpparser.c" \
     -I"$SRC/picohttpparser" -I"$PREFIX/libuv/include" -I"$LUAJIT/include/luajit-2.1" \
-    -I"$PREFIX/mbedtls/include" \
-    -L"$PREFIX/libuv/lib" -L"$LUAJIT/lib" -L"$PREFIX/mbedtls/lib" \
-    -lluajit-5.1 -luv -lmbedtls -lmbedx509 -lmbedcrypto -lm -ldl -lpthread -lrt
+    -I"$PREFIX/mbedtls/include" -I"$PREFIX/curl/include" \
+    -L"$PREFIX/libuv/lib" -L"$LUAJIT/lib" -L"$PREFIX/mbedtls/lib" -L"$PREFIX/curl/lib" \
+    -lluajit-5.1 -luv -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lm -ldl -lpthread -lrt
 }
 
 targets=("$@")
 if [ ${#targets[@]} -eq 0 ]; then
-  targets=(luajit luarocks luv wrk libuv pico mbedtls c-httpd)
+  targets=(luajit luarocks luv wrk libuv pico mbedtls curl c-httpd)
 fi
 for t in "${targets[@]}"; do
   log ">>> build $t"

@@ -32,3 +32,13 @@ src/*/build/
 # temporary benchmark/log dirs
 bench/logs/
 bench/.tmp-*
+
+# generated config artifacts (build outputs, do not commit)
+src/config_cdef.lua
+src/*.bc
+src/*_bc.h
+
+# python caches
+__pycache__/
+*.pyc
+.pytest_cache/
