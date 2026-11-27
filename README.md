@@ -7,7 +7,7 @@ mbedTLS 提供 HTTPS。
 
 - 单进程；默认单事件循环，可配置多 worker 线程（每 worker 独立 libuv loop + LuaJIT VM，
   `SO_REUSEPORT` 监听同一端口）；每请求一个 Lua 协程
-- 流式请求体/响应体、协程背压；小 body 自动缓冲
+- 流式请求体/响应体、协程背压；请求体支持 Content-Length 与 `Transfer-Encoding: chunked`
 - HTTP/HTTPS 多 listener、keep-alive、pipeline
 - SNI 多证书、per-SNI mTLS（不同域名不同客户端 CA / 是否要求客户端证书）
 - 客户端证书吊销表（SHA-256 指纹，mock/数据库 provider 形态）
@@ -61,6 +61,6 @@ curl -i http://127.0.0.1:8080/
 
 ## 当前限制
 
-HTTP/1.1 only；请求体只支持 Content-Length；`routes` 配置和 C 层 multipart 上传尚未实现；
+HTTP/1.1 only；`routes` 配置和 C 层 multipart 上传尚未实现；
 SNI 不支持 IDN/多级通配；`tls.ciphers` 暂未应用。多 worker（`server.workers > 1`）为 P0：
 暂不支持 SIGHUP reload；TLS 证书材料仍按 worker 各构建一份。完整列表见用户手册第 12 节。

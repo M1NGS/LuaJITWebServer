@@ -522,6 +522,10 @@ typedef struct request_s {
   int waiting_read;
   int waiting_drain;
   int discarding;
+  int chunked;               /* Transfer-Encoding: chunked */
+  int chunk_state;           /* 0=size,1=data,2=CRLF,3=trailer,4=done */
+  size_t chunk_remaining;
+  size_t chunk_total;
 
   resp_mode_t mode;
   int head_sent;
@@ -3500,12 +3504,14 @@ static void push_req_table(conn_t *c)
   }
   lua_setfield(co, -2, "headers");
   /* 显式三态，避免 req.body == nil 同时表示“无 body”和“大 body” */
-  lua_pushboolean(co, r->body_cl > 0);
+  lua_pushboolean(co, r->body_cl > 0 || r->chunked);
   lua_setfield(co, -2, "has_body");
-  lua_pushinteger(co, (lua_Integer)r->body_cl);
+  lua_pushinteger(co, (lua_Integer)(r->chunked ? 0 : r->body_cl));
   lua_setfield(co, -2, "body_size");
-  lua_pushboolean(co, r->body_cl > g_auto_buffer_body);
+  lua_pushboolean(co, r->chunked || r->body_cl > g_auto_buffer_body);
   lua_setfield(co, -2, "streaming");
+  lua_pushboolean(co, r->chunked);
+  lua_setfield(co, -2, "chunked");
   if (r->auto_buffer && r->body_cl > 0) {
     lua_pushlstring(co, r->body_buf ? r->body_buf : "", r->body_cl);
     lua_setfield(co, -2, "body");
@@ -3786,7 +3792,7 @@ static void deliver_body(conn_t *c)
       r->waiting_read = 0;
       int rc = lua_resume(r->co, 1);
       on_resume(c, rc);
-    } else if (r->body_received >= r->body_cl) {
+    } else if (r->chunked ? r->body_eof : (r->body_received >= r->body_cl)) {
       r->body_eof = 1;
       lua_pushnil(r->co);
       r->waiting_read = 0;
@@ -3860,9 +3866,21 @@ static int try_parse_head(conn_t *c)
     send_error(c, 400, "missing Host");
     return 0;
   }
-  if (hdr_find(r->headers, num_headers, "transfer-encoding", NULL)) {
-    send_error(c, 400, "Transfer-Encoding not supported");
-    return 0;
+  /* Transfer-Encoding: 只接受单个 "chunked"（不支持 gzip 等其它 coding） */
+  int te_chunked = 0, te_count = 0;
+  for (size_t i = 0; i < num_headers; i++) {
+    if (!r->headers[i].name || r->headers[i].name_len != 17) continue;
+    if (strncasecmp(r->headers[i].name, "transfer-encoding", 17) != 0) continue;
+    te_count++;
+    const char *v = r->headers[i].value;
+    size_t vl = r->headers[i].value_len;
+    while (vl && (v[0] == ' ' || v[0] == '\t')) { v++; vl--; }
+    while (vl && (v[vl - 1] == ' ' || v[vl - 1] == '\t')) vl--;
+    if (vl == 7 && strncasecmp(v, "chunked", 7) == 0 && te_chunked == 0) {
+      te_chunked = 1;
+    } else {
+      te_chunked = -1;
+    }
   }
 
   ssize_t cl = -1;
@@ -3881,12 +3899,19 @@ static int try_parse_head(conn_t *c)
     }
   }
   if (n_cl > 1 || cl_bad) { send_error(c, 400, "invalid Content-Length"); return 0; }
-  if (cl > 0 && (unsigned long long)cl > (unsigned long long)max_body_stream) {
+  if (te_count > 0) {
+    if (minor < 1) { send_error(c, 400, "Transfer-Encoding requires HTTP/1.1"); return 0; }
+    if (te_chunked != 1) { send_error(c, 400, "unsupported Transfer-Encoding"); return 0; }
+    if (n_cl > 0) { send_error(c, 400, "Content-Length with Transfer-Encoding"); return 0; }
+    r->chunked = 1;
+  }
+  if (!r->chunked && cl > 0 && (unsigned long long)cl > (unsigned long long)max_body_stream) {
     send_error(c, 413, "body too large");
     return 0;
   }
-  r->body_cl = cl > 0 ? (size_t)cl : 0;
-  r->auto_buffer = r->body_cl <= g_auto_buffer_body;
+  r->body_cl = (!r->chunked && cl > 0) ? (size_t)cl : 0;
+  r->auto_buffer = !r->chunked && r->body_cl <= g_auto_buffer_body;
+  r->chunk_state = 0;
   r->is_head = (method_len == 4 && strncasecmp(r->method, "HEAD", 4) == 0);
 
   int ka = minor >= 1;
@@ -3908,9 +3933,140 @@ static int try_parse_head(conn_t *c)
   return 1;
 }
 
+static int consume_chunked(conn_t *c)
+{
+  request_t *r = &c->req;
+
+  while (!c->closing) {
+    if (r->chunk_state == 0) {           /* chunk-size CRLF */
+      const char *nl = (const char *)memchr(c->buf, '\n', c->len);
+      if (!nl) {
+        if (c->len > 1024) { send_error(c, 400, "bad chunk size"); return 0; }
+        return 0;
+      }
+      size_t line_len = (size_t)(nl - c->buf) + 1;
+      size_t i = 0;
+      unsigned long long sz = 0;
+      int digits = 0;
+      while (i < line_len) {
+        char ch = c->buf[i];
+        if (ch == ';') break;            /* chunk extension 忽略 */
+        if (ch == '\r' || ch == '\n') break;
+        int v;
+        if (ch >= '0' && ch <= '9') v = ch - '0';
+        else if (ch >= 'a' && ch <= 'f') v = ch - 'a' + 10;
+        else if (ch >= 'A' && ch <= 'F') v = ch - 'A' + 10;
+        else { send_error(c, 400, "bad chunk size"); return 0; }
+        sz = sz * 16 + (unsigned long long)v;
+        if (sz > (1ULL << 40)) { send_error(c, 400, "chunk too large"); return 0; }
+        digits++;
+        i++;
+      }
+      if (!digits) { send_error(c, 400, "bad chunk size"); return 0; }
+      buf_consume(c, line_len);
+      if (sz == 0) {
+        r->chunk_state = 3;             /* trailers */
+      } else {
+        r->chunk_remaining = (size_t)sz;
+        r->chunk_state = 1;
+      }
+      continue;
+    }
+
+    if (r->chunk_state == 1) {           /* chunk data */
+      if (c->len == 0) return 0;
+      size_t n = c->len < r->chunk_remaining ? c->len : r->chunk_remaining;
+      if (!r->discarding && r->chunk_total + n > max_body_stream) {
+        send_error(c, 413, "body too large");
+        return 0;
+      }
+      if (r->discarding) {
+        r->body_received += n;
+        r->chunk_total += n;
+      } else if (r->waiting_read) {
+        lua_pushlstring(r->co, c->buf, n);
+        r->waiting_read = 0;
+        r->body_received += n;
+        r->body_delivered += n;
+        r->chunk_total += n;
+        buf_consume(c, n);
+        int rc = lua_resume(r->co, 1);
+        on_resume(c, rc);
+        if (c->closing) return 0;
+      } else {
+        if (append_body_buf(r, c->buf, n) != 0) { close_conn(c); return 0; }
+        r->body_received += n;
+        r->chunk_total += n;
+        buf_consume(c, n);
+        if (!c->read_paused && r->body_len >= g_read_high_water) {
+          c->read_paused = 1;
+          uv_read_stop((uv_stream_t *)&c->handle);
+        }
+      }
+      if (r->discarding) buf_consume(c, n);
+      r->chunk_remaining -= n;
+      if (r->chunk_remaining == 0) r->chunk_state = 2;
+      continue;
+    }
+
+    if (r->chunk_state == 2) {           /* CRLF after data */
+      if (c->len < 2) return 0;
+      if (c->buf[0] != '\r' || c->buf[1] != '\n') {
+        send_error(c, 400, "bad chunk terminator");
+        return 0;
+      }
+      buf_consume(c, 2);
+      r->chunk_state = 0;
+      continue;
+    }
+
+    if (r->chunk_state == 3) {           /* trailer section 以空行结束 */
+      size_t end = 0;
+      int found = 0;
+      if (c->len >= 2 && c->buf[0] == '\r' && c->buf[1] == '\n') {
+        end = 2;
+        found = 1;
+      } else {
+        for (size_t i = 0; i + 3 < c->len; i++) {
+          if (c->buf[i] == '\r' && c->buf[i + 1] == '\n' &&
+              c->buf[i + 2] == '\r' && c->buf[i + 3] == '\n') {
+            end = i + 4;
+            found = 1;
+            break;
+          }
+        }
+      }
+      if (!found) {
+        if (c->len > 8192 + 4) { send_error(c, 400, "trailer too large"); return 0; }
+        return 0;
+      }
+      buf_consume(c, end);
+      r->chunk_state = 4;
+      r->body_eof = 1;
+      if (r->waiting_read) {
+        lua_pushnil(r->co);
+        r->waiting_read = 0;
+        int rc = lua_resume(r->co, 1);
+        on_resume(c, rc);
+        if (c->closing) return 0;
+      }
+      if (r->discarding && !c->closing) {
+        request_finalize(c);
+        return 1;
+      }
+      return 1;
+    }
+
+    return 1;                            /* done */
+  }
+  return 0;
+}
+
 static int consume_body(conn_t *c)
 {
   request_t *r = &c->req;
+
+  if (r->chunked) return consume_chunked(c);
 
   size_t want = r->body_cl - r->body_received;
   size_t avail = c->len;
@@ -3948,6 +4104,10 @@ static int consume_body(conn_t *c)
       close_conn(c);
       return 0;
     }
+    if (r->discarding) {
+      request_finalize(c);
+      return 1;
+    }
     if (r->auto_buffer && c->state == ST_BODY) {
       start_handler(c); /* req.body 为完整串 */
       return 1;
@@ -3980,8 +4140,7 @@ static void request_finalize(conn_t *c)
     return;
   }
 
-  /* 响应已发完但请求体还有剩余：丢弃掉才能复用连接 */
-  if (r->body_received < r->body_cl) {
+  if (r->chunked ? !r->body_eof : (r->body_received < r->body_cl)) {
     r->discarding = 1;
     c->state = ST_BODY;
     if (!c->read_paused) {

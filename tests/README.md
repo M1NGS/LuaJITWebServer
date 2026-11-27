@@ -3,7 +3,7 @@
 本目录是 `luajit-httpd` 的功能回归测试套件。每个测试脚本都是**独立可运行**的：自动选择空闲端口、
 创建临时目录/配置/证书、启动自己的服务器进程、执行用例、停止进程并清理，不依赖预先启动的服务。
 
-当前共 18 个套件（16 个 LLM + 2 个 HUMAN），`python3 -I tests/run_all.py` 全部通过。
+当前共 19 个套件（17 个 LLM + 2 个 HUMAN），`python3 -I tests/run_all.py` 全部通过。
 
 ## 目录
 
@@ -78,6 +78,7 @@ python3 -I tests/HUMAN/02_shutdown_contract_test.py
 | `LLM/14_reload_test.py` | `--check` 成功/语法错/缺 endpoint/缺证书/日志路径不可写/缺 app、不绑定运行中端口；SIGHUP reload 路径切换、失败回滚、listen 变化拒绝、TLS 证书重载 |
 | `LLM/15_multiworker_test.py` | `server.workers=4` 启动、64 并发、access 日志完整、线程数、`reuse_port=1`、SIGHUP 拒绝、SIGTERM 退出 0、端口 0 + workers>1 拒绝 |
 | `LLM/16_log_pipeline_test.py` | 4 worker 日志管道：file/OTLP/syslog 汇总、rotate、优雅退出后行数完整 |
+| `LLM/17_chunked_request_test.py` | chunked 上传/回显、trailer、跨包 size、HTTP/1.0 TE/非 chunked/CL+TE 拒绝、丢弃后 keep-alive、超 max_body 413 |
 | `HUMAN/01_req_body_tristate_test.py` | 用户质疑的 `req.body == nil` 歧义：无 body / 小 body / 大 body 的 `has_body/body_size/streaming/buffered` 与 GET `/echo` 400 |
 | `HUMAN/02_shutdown_contract_test.py` | 用户确认的退出契约：首次 SIGINT 关闭监听/空闲连接、新连接拒绝；在飞请求受 `shutdown_timeout` 约束 |
 
@@ -85,7 +86,7 @@ python3 -I tests/HUMAN/02_shutdown_contract_test.py
 
 | 功能 | 主要用例 |
 |---|---|
-| HTTP 解析/校验 | 01, 08, 09 |
+| HTTP 解析/校验 | 01, 08, 09, 17 |
 | 请求体缓冲/流式/背压 | 01, 02, HUMAN/01 |
 | 响应 CL/chunked/close、HEAD | 01, 02, 06 |
 | keep-alive / pipeline | 01, 02, 08 |
@@ -119,7 +120,7 @@ python3 -I tests/HUMAN/02_shutdown_contract_test.py
 
 ## 已知未覆盖（当前版本）
 
-- HTTP/2、chunked 请求体、C 层 multipart 上传、`routes`/`uploader` 配置（尚未实现）
+- HTTP/2、C 层 multipart 上传、`routes`/`uploader` 配置（尚未实现）
 - SNI IDN 自动转换、多级通配、`tls.ciphers` 应用
 - 吊销后主动断开已建立连接、TLS 会话恢复重新校验
 - CPU-bound handler 期间的优雅退出（单线程 loop 无法中断）

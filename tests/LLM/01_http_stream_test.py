@@ -78,8 +78,8 @@ def main():
         r.case("HEAD /download no body", st == 200 and len(b) == 0, f"status={st}")
 
         st, h, b = http_request(port, "/upload", "POST",
-                                headers=["Transfer-Encoding: chunked"])
-        r.case("POST /upload TE chunked -> 400", st == 400, f"status={st}")
+                                headers=["Transfer-Encoding: gzip"])
+        r.case("POST /upload unsupported TE -> 400", st == 400, f"status={st}")
 
         payload = (b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
                    b"POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")

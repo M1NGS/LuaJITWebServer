@@ -399,9 +399,10 @@ return { handle = handle }
 | `req.query` | `?` 后的原始字符串，不做 URL 解码 |
 | `req.headers` | 表：header 名 → 值；名称大小写按收到字节保留；同名后者覆盖 |
 | `req.has_body` | 是否有请求体 |
-| `req.body_size` | Content-Length 字节数（无 body 为 0） |
-| `req.streaming` | body 超过自动缓冲阈值（此时 `req.body` 为 nil） |
-| `req.body` | 小 body（<= 1 MiB）为字符串；流式/无 body 为 nil |
+| `req.body_size` | Content-Length 字节数（无 body 或 chunked 为 0） |
+| `req.streaming` | body 超过自动缓冲阈值或为 chunked（此时 `req.body` 为 nil） |
+| `req.chunked` | 请求体是否为 `Transfer-Encoding: chunked` |
+| `req.body` | 小 body（<= 1 MiB）为字符串；流式/chunked/无 body 为 nil |
 
 读取请求体：
 
@@ -421,6 +422,15 @@ end
 ```
 
 `req:read()` / `req:text()` 只能在 handler 协程内调用（handler 本身就在协程里）。
+
+请求体协议：
+
+- `Content-Length`：小 body（<= `auto_buffer_body`）收齐后给 `req.body`；大 body 流式。
+- `Transfer-Encoding: chunked`（仅 HTTP/1.1）：始终流式（`req.chunked = true`、
+  `req.body = nil`、`req.body_size = 0`），用 `req:read()` / `req:text()` 读取；
+  支持 chunk extensions（忽略）和 trailer（丢弃）。
+- 只接受单个 `chunked` coding；其他 coding、HTTP/1.0 的 TE、TE 与 CL 同时出现都返回 400；
+  畸形 chunk size/终止符/trailer 超限返回 400；解码后总量超过 `limits.max_body` 返回 413。
 
 ### 5.2 res 方法
 
@@ -715,7 +725,7 @@ BENCH_REPEAT=3 bash bench/run.sh c-httpd
 | TLS 启动报 `cannot load cert/key` | 路径/权限/PEM 格式；证书和私钥必须匹配 |
 | mTLS 握手失败 | 客户端未带证书、CA 不匹配、SNI 的 `client_auth/ca` 配置不对 |
 | 大请求返回 413 | `limits.max_body`（默认 128 MiB）或 `HTTPD_MAX_BODY` |
-| POST chunked 返回 400 | 当前请求体只支持 Content-Length |
+| POST 返回 400 | 检查 `Transfer-Encoding`：只接受单个 `chunked`，且不能同时带 `Content-Length`；畸形 chunk 也返回 400 |
 | 日志没有生成 | 目录不存在/权限不足；error log 会回退 stderr |
 | OTLP 没有数据 | endpoint/网络/防火墙；`flush_interval` 未到；后端是否实现 `POST /v1/logs`；token/CA；启动日志是否有配置校验错误 |
 | syslog 收不到 | transport/host/port 与接收端一致；UDP 可能丢包；tcp/tls 看 `reconnect_interval` 与 CA；`access/error/level` 过滤是否把该条挡掉了 |
@@ -726,7 +736,7 @@ BENCH_REPEAT=3 bash bench/run.sh c-httpd
 ## 12. 当前限制与 FAQ
 
 - 只支持 HTTP/1.1；不支持 HTTP/2。
-- 请求体只支持 Content-Length；chunked 请求体返回 400。
+- 请求体支持 Content-Length 和 `Transfer-Encoding: chunked`（仅 chunked coding；其他 TE、HTTP/1.0 TE、CL+TE 返回 400）。
 - `routes` 配置尚未实现；路由在 `app.lua` 内自己判断。`uploader` 只是透传业务配置。
 - C 层 multipart 上传尚未实现（见 `TODO.md`）。
 - SNI 不支持 IDN Unicode 自动转换和多级通配；配置写 Punycode/精确名。

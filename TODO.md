@@ -34,7 +34,8 @@ Lua 只拿字段和文件元数据，不在 Lua 层做流式解析。
 - P1：vendor 解析器 + 头识别/boundary 校验 + 单遍解析落盘 + `req.fields`/`req.files` +
   上限 + 清理 + 测试（多文件、多字段、二进制数据、boundary 跨块、格式错误、磁盘写失败、
   客户端中途断开、大文件内存曲线）
-- P2：chunked 请求体、C 增量 SHA1、`uv_fs_write` 异步写盘、RFC 5987 `filename*`
+- P2：C 增量 SHA1、`uv_fs_write` 异步写盘、RFC 5987 `filename*`
+  （chunked 请求体已完成 2026-11-28：CL/chunked 双模式、trailer 丢弃、跨包/畸形校验）
 
 ### 待决
 
@@ -109,7 +110,7 @@ handler 仍由 Lua 执行；`kind="upload"` 与 C 层 multipart 上传联动。
 - `tests/LLM/`：HTTP/流式、TLS、SNI、mTLS、吊销表、日志格式、rotate、三通道外发、健壮性、配置校验、旧模式/TCP、Lua API
 - `tests/HUMAN/`：人工确认的 body 三态语义、优雅退出契约
 - 每个脚本独立起停服务、临时证书/配置、统一 `TEST/CASE/RESULT` 输出
-- `python3 -I tests/run_all.py`，当前 16/16 套件通过；详见 `tests/README.md`
+- `python3 -I tests/run_all.py`，当前 19/19 套件通过；详见 `tests/README.md`
 
 ## 8. 配置 FFI 化（P1 已完成 2026-11-28，P2 待做）
 
@@ -145,7 +146,7 @@ handler 仍由 Lua 执行；`kind="upload"` 与 C 层 multipart 上传联动。
   证书路径只读。
 - P0 限制：SIGHUP reload 拒绝；OTLP/syslog 和内置日志 rotate 在多 worker 下禁用；端口 0
   只允许 workers=1；`max_connections` 按 worker 计算；无连接迁移。
-- 测试：`tests/LLM/15_multiworker_test.py`（10 用例），全量 17 套件通过。
+- 测试：`tests/LLM/15_multiworker_test.py`（10 用例），全量 19 套件通过。
 - P1 已完成（2026-11-28）：per-worker SPSC ring（access 1 MiB / error 64 KiB）+ 单 collector
   按 targets 位图分发；file writer 单写者写盘/rotate；OTLP/syslog 发送线程从 collector 入队；
   关闭顺序 worker→collector→file→发送线程；多 worker 三通道和内置 rotate 已启用。

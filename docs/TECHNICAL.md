@@ -14,8 +14,9 @@
 - **运行时特性**：流式请求体/响应体、背压、协程 API、SNI 多证书、per-SNI mTLS、
   客户端证书吊销表、固定格式异步日志、优雅退出
 
-当前版本支持 HTTP/1.1（含 keep-alive/pipeline）、HTTP/1.0 close 定界；不支持 HTTP/2、
-chunked 请求体、`routes` 配置和 C 层 multipart 上传（见第 12 节）。
+当前版本支持 HTTP/1.1（含 keep-alive/pipeline）、HTTP/1.0 close 定界、请求体
+Content-Length 与 `Transfer-Encoding: chunked`；不支持 HTTP/2、`routes` 配置和
+C 层 multipart 上传（见第 12 节）。
 
 ## 2. 总体架构
 
@@ -104,23 +105,28 @@ A/B 方式，避免阻塞事件循环。
 - `MAX_HEADERS = 64`，`buffers.max_head` 默认 16 KiB；超过 431。
 - HTTP/1.1 必须有 `Host`；缺失 400。
 - 重复 `Content-Length` / 非法 CL → 400。
-- 当前只支持 Content-Length 请求体；`Transfer-Encoding` → 400（chunked 请求体待补）。
+- `Transfer-Encoding`：只接受单个 `chunked`（HTTP/1.1）；其他 coding、HTTP/1.0 TE、
+  TE 与 CL 同时出现 → 400。
 - `Connection` 按逗号 token 解析（大小写不敏感），支持 HTTP/1.0 `keep-alive`。
 - 请求路径 `req.path` 已剥离 query，原始 target 保留用于 access log；`req.query` 不做 URL 解码。
 
 ## 6. 请求体：缓冲、流式、背压
 
-请求体只支持 Content-Length。
+请求体支持 Content-Length 和 `Transfer-Encoding: chunked`。
 
 - `cl <= auto_buffer_body`（默认 1 MiB）：收齐后给 `req.body` 字符串；handler 启动前 body 已在内存。
 - `cl > auto_buffer_body`：handler 立即启动，`req.body == nil`，只能 `req:read()`。
+- `chunked`：handler 立即启动，始终流式（`req.chunked=true`、`body_size=0`、`body=nil`）；
+  解码状态机 `size → data → CRLF → … → 0 → trailer`，chunk extensions 忽略、trailer 丢弃；
+  解码后的数据走与 Content-Length 相同的交付/背压路径；解码总量超过 `limits.max_body` → 413。
 - `req:read()` 每块最多 64 KiB；body 结束返回 `nil`。
   - 已缓冲数据（`body_buf`）优先交付；没有则等 socket 数据。
   - 未交付缓冲超过 `read_high_water`（默认 1 MiB）→ `uv_read_stop`；Lua 消费后恢复。
-- `req:text(max_bytes?)`：小 body 直接返回 `req.body`（不再检查 `max_bytes`）；大 body 循环 `read()`
+- `req:text(max_bytes?)`：小 body 直接返回 `req.body`（不再检查 `max_bytes`）；大 body/chunked 循环 `read()`
   聚合，累计超过 `max_bytes` 时抛 Lua 错误。
-- 响应完成时 body 仍未读完：`discarding=1`，继续读并丢弃，保证 keep-alive 的下一个请求不受污染。
-- `cl > limits.max_body`（默认 128 MiB，`HTTPD_MAX_BODY` 可覆盖）在 handler 启动前 413。
+- 响应完成时 body 仍未读完：`discarding=1`，继续解析并丢弃，保证 keep-alive 的下一个请求不受污染。
+- Content-Length > `limits.max_body`（默认 128 MiB，`HTTPD_MAX_BODY` 可覆盖）在 handler 启动前 413；
+  chunked 总量在解码过程中检查。
 - `MAX_BODY_STREAM` 的语义是“总请求体上限”，不是单次内存上限。
 
 ## 7. Lua 运行时与分发
@@ -487,6 +493,12 @@ LuaJIT 是共享库，运行时需要 `LD_LIBRARY_PATH=prefix/luajit/lib`。
 | `tests/LLM/09_config_validation_test.py` | 配置校验/启动失败 |
 | `tests/LLM/10_legacy_tcp_test.py` | 旧模式、keepalive、缓冲区、SO_REUSEPORT |
 | `tests/LLM/11_lua_api_test.py` | query/headers/text(max)/header map/204/304/queue_size |
+| `tests/LLM/12_log_sinks_test.py` | file/OTLP/syslog 三通道、过滤、批量/重试、syslog 传输 |
+| `tests/LLM/13_ffi_config_test.py` | 普通 table 隐式 FFI 配置、ABI、库/C 校验 |
+| `tests/LLM/14_reload_test.py` | `--check`、SIGHUP reload、失败回滚、listen 变化拒绝 |
+| `tests/LLM/15_multiworker_test.py` | workers=4、SO_REUSEPORT、并发、日志、SIGHUP 拒绝、退出 |
+| `tests/LLM/16_log_pipeline_test.py` | 多 worker 日志 ring/collector/file writer、三通道、rotate |
+| `tests/LLM/17_chunked_request_test.py` | chunked 上传/回显、trailer、跨包、TE 校验、丢弃后 keep-alive、413 |
 | `tests/HUMAN/01_req_body_tristate_test.py` | body 三态语义（人工确认） |
 | `tests/HUMAN/02_shutdown_contract_test.py` | 优雅退出契约（人工确认） |
 | `bench/tests/pico_robust.py` | pico/luv 辅助服务器健壮性 |
@@ -512,7 +524,7 @@ WSL 抖动较大，历史数值仅作量级参考；当前版本未重新做完�
 - TLS 证书/私钥、配置中的数据库 DSN 应限制文件权限（建议 0600/0700）。
 - 请求体上限、头大小、连接数、写队列硬上限是基础防 DoS 边界。
 - 响应头过滤 CR/LF；access log 转义控制字符。
-- 重复 CL、TE、缺 Host 已拒绝；chunked 请求体不支持（400）。
+- 重复 CL、非法 TE（非单个 chunked、HTTP/1.0 TE、CL+TE）、缺 Host 已拒绝；chunked 请求体支持。
 - mTLS 与吊销表只覆盖新握手；会话恢复语义见第 10 节。
 - `config` 全局可被 Lua 业务读取；不要在日志/响应中泄露 DSN/证书私钥。
 
@@ -521,7 +533,7 @@ WSL 抖动较大，历史数值仅作量级参考；当前版本未重新做完�
 当前限制：
 
 - HTTP/1.1 only；无 HTTP/2
-- 请求体只支持 Content-Length（chunked 400）
+- 请求体支持 Content-Length 和 `Transfer-Encoding: chunked`（仅单个 chunked coding）
 - 无 `routes` 配置（路由在 app.lua 内自己判断）；`uploader` 只是透传业务配置
 - C 层 multipart 上传未实现（见 `TODO.md`）
 - SNI 不支持 IDN/多级通配；`tls.ciphers` 未应用
