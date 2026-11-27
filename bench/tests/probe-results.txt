@@ -1,0 +1,44 @@
+=== baseline ===
+normal GET                       rc=   27 ACCEPT   method="GET" path="/" minor=1 headers=1
+keepalive, 3 headers             rc=   59 ACCEPT   method="GET" path="/" minor=1 headers=3
+HTTP/1.0                         rc=   18 ACCEPT   method="GET" path="/" minor=0 headers=0
+partial (no blank line)          rc=   -2 PARTIAL  
+
+=== UTF-8 / multibyte ===
+utf8 path raw                    rc=   40 ACCEPT   method="GET" path="/中文/路径" minor=1 headers=1
+utf8 path percent-encoded        rc=   55 ACCEPT   method="GET" path="/%E4%B8%AD%E6%96%87/%E9%81%8C" minor=1 headers=1
+utf8 query raw                   rc=   42 ACCEPT   method="GET" path="/search?q=中文" minor=1 headers=1
+utf8 query percent-encoded       rc=   54 ACCEPT   method="GET" path="/search?q=%E4%B8%AD%E6%96%87" minor=1 headers=1
+utf8 header value                rc=   43 ACCEPT   method="GET" path="/" minor=1 headers=2
+utf8 header name                 rc=   -1 REJECT   
+utf8 in method                   rc=   -1 REJECT   
+emoji in path raw                rc=   31 ACCEPT   method="GET" path="/😀" minor=1 headers=1
+raw byte 0x80 in path            rc=   28 ACCEPT   method="GET" path="/�" minor=1 headers=1
+
+=== malformed requests ===
+bad method (space)               rc=   -1 REJECT   
+bad version 9.9                  rc=   -1 REJECT   
+no Host (HTTP/1.1)               rc=   18 ACCEPT   method="GET" path="/" minor=1 headers=0
+bare LF line endings             rc=   24 ACCEPT   method="GET" path="/" minor=1 headers=1
+leading CRLF                     rc=   29 ACCEPT   method="GET" path="/" minor=1 headers=1
+empty request                    rc=   -2 PARTIAL  
+only CRLF                        rc=   -1 REJECT   
+NUL in path                      rc=   -1 REJECT   
+space in path                    rc=   -1 REJECT   
+tab in path                      rc=   -1 REJECT   
+header value CRLF injection      rc=   53 ACCEPT   method="GET" path="/" minor=1 headers=3
+
+=== semantic conflicts (smuggling vectors) ===
+duplicate Content-Length         rc=   65 ACCEPT   method="GET" path="/" minor=1 headers=3
+TE chunked + Content-Length      rc=   75 ACCEPT   method="POST" path="/" minor=1 headers=3
+obs-fold header                  rc=   39 ACCEPT   method="GET" path="/" minor=1 headers=3
+
+=== limits ===
+long URI 1 KiB                   rc= 1051 ACCEPT   method="GET" path="/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..." minor=1 headers=1
+long URI 8 KiB                   rc= 8219 ACCEPT   method="GET" path="/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..." minor=1 headers=1
+long URI 16 KiB                  rc=16411 ACCEPT   method="GET" path="/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..." minor=1 headers=1
+long header value 8 KiB          rc= 8229 ACCEPT   method="GET" path="/" minor=1 headers=2
+40 headers (cap 32)              rc=   -1 REJECT   
+64 headers (cap 32)              rc=   -1 REJECT   
+header value 0x7f                rc=   -1 REJECT   
+header value 0x80                rc=   35 ACCEPT   method="GET" path="/" minor=1 headers=2

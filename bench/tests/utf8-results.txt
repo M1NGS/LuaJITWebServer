@@ -1,0 +1,6 @@
+== Connection header handling (port 8080) ==
+  Connection: close      status=HTTP/1.1 200 OK closed_after_response=True
+  no Connection header   status=HTTP/1.1 200 OK closed_after_response=False
+  CONNECTION: CLOSE      status=HTTP/1.1 200 OK closed_after_response=True
+== UTF-8 response (port 8081) ==
+  status=HTTP/1.1 200 OK content-length=22 body_bytes=22 expected=22 body_matches=True

@@ -1,0 +1,15 @@
+target: 127.0.0.1:8080
+legacy table GET /                             HTTP/1.1 200 OK      len=      13 cl=13 te=-
+GET /utf8                                      HTTP/1.1 200 OK      len=      22 cl=22 te=-
+POST /echo small (5B)                          HTTP/1.1 200 OK      len=       5 cl=5 te=-
+POST /upload 2 MiB streaming                   HTTP/1.1 200 OK      len=      22 cl=22 te=-
+POST /echo 2 MiB (stream count)                HTTP/1.1 200 OK      len=      16 cl=16 te=-
+GET /download chunked 10 MiB                   HTTP/1.1 200 OK      len=10485760 cl=- te=chunked
+GET /download-cl CL 10 MiB                     HTTP/1.1 200 OK      len=10485760 cl=10485760 te=-
+GET /events SSE                                HTTP/1.1 200 OK      len=     291 cl=- te=chunked
+GET /download HTTP/1.0 close-delimited         HTTP/1.1 200 OK      len=10485760 cl=- te=-
+HEAD /download (no body)                       HTTP/1.1 200 OK      len=       0 cl=0 te=-
+POST /upload with TE chunked (expect 400)      HTTP/1.1 400 Bad Request len=      36 cl=36 te=-
+pipeline: GET / + POST /upload                 responses=2/2
+slow reader: /download after 1.2s pause        HTTP/1.1 200 OK      len=10485760
+after abort: GET /                             HTTP/1.1 200 OK      len=      13 cl=13 te=-

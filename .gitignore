@@ -1,0 +1,34 @@
+# ZCode local workspace/plans
+.zcode/
+
+# build outputs and vendored sources (WSL workspace)
+prefix/
+build/
+src/LuaJIT/
+src/libuv/
+src/mbedtls/
+src/luarocks/
+src/wrk/
+src/picohttpparser/
+src/*/build/
+
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.log
+*.tar.gz
+*.tar.bz2
+*.zip
+
+# local cert/key material
+*.pem
+*.key
+*.crt
+*.crl
+*.srl
+
+# temporary benchmark/log dirs
+bench/logs/
+bench/.tmp-*

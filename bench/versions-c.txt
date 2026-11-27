@@ -1,0 +1,8 @@
+date: 2026-11-27T06:36:49+08:00
+arch: C host (libuv C API + picohttpparser + embedded LuaJIT)
+luajit: LuaJIT 2.1.1795687819 -- Copyright (C) 2005-2026 Mike Pall. https://luajit.org/
+libuv: 1.53.0 (built from source, static)
+picohttpparser: dd573d8 2026-10-27
+wrk: 4.1.0 [-t4 -c100 -d20s]
+httpd.c lines: 511
+app.lua lines: 34

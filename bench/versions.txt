@@ -1,0 +1,12 @@
+date: 2026-11-27T04:56:00+08:00
+kernel: 6.6.87.2-microsoft-standard-WSL2
+cpu_mem: 12 vCPU / 15 GiB
+luajit: LuaJIT 2.1.1795687819 -- Copyright (C) 2005-2026 Mike Pall. https://luajit.org/
+luarocks: /root/workspaces/LuaJITHttpserver/prefix/luarocks/bin/luarocks 3.13.0
+luv: 1.53.0-1 (bundled libuv)
+coro-http-luv: 1.1.0-0
+wrk: wrk 4.1.0 [epoll] (自编译, 链接 LuaJIT 2.1.1795687819; -t4 -c100 -d20s)
+llhttp: 9.4.4
+luvi: /root/workspaces/LuaJITHttpserver/src/luvi/build/luvi v2.15.0-20-g4b9e16e
+luvit: master tarball (2026-11)
+weblit: master tarball (last push 2022-10-16)

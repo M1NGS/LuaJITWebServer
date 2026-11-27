@@ -1,0 +1,18 @@
+utf8 query raw                             resp=HTTP/1.1 404 Not Found bytes= 165 closed=False
+utf8 header value                          resp=200            bytes= 161 closed=False
+utf8 header name                           resp=HTTP/1.1 400 Bad Request bytes= 142 closed=True
+emoji path raw                             resp=HTTP/1.1 404 Not Found bytes= 165 closed=False
+
+=== limits / body ===
+URI 8 KiB                                  resp=HTTP/1.1 404 Not Found bytes= 165 closed=False
+URI 16 KiB                                 resp=HTTP/1.1 431 Request Header Fields Too L bytes= 167 closed=True
+header value 8 KiB                         resp=200            bytes= 161 closed=False
+40 headers (server cap 32)                 resp=200            bytes= 161 closed=False
+POST with body (len 4)                     resp=200            bytes= 161 closed=False
+POST then GET on same conn                 responses=2/2
+
+=== concurrency ===
+200 concurrent connections                 ok=200/200
+
+=== health ===
+server alive after all tests: YES

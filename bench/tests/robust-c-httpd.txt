@@ -1,0 +1,42 @@
+target: 127.0.0.1:8080
+=== baseline ===
+normal GET                                 resp=200            bytes= 161 closed=False
+keep-alive 3 requests                      responses=3/3
+pipeline 2 requests                        responses=0/2
+pipeline 3 requests                        responses=0/3
+partial request (split)                    resp=200            bytes= 161 closed=False
+partial in method                          resp=200            bytes= 161 closed=False
+
+=== malformed ===
+empty connection (no bytes)                resp=NO-RESP        bytes=   0 closed=False
+only CRLF                                  resp=HTTP/1.1 400 Bad Request bytes= 142 closed=True
+bad method with space                      resp=HTTP/1.1 400 Bad Request bytes= 142 closed=True
+bad version 9.9                            resp=HTTP/1.1 400 Bad Request bytes= 142 closed=True
+bare LF line endings                       resp=200            bytes= 161 closed=False
+leading CRLF                               resp=200            bytes= 161 closed=False
+NUL byte in path                           resp=HTTP/1.1 400 Bad Request bytes= 142 closed=True
+space in path                              resp=HTTP/1.1 400 Bad Request bytes= 142 closed=True
+CRLF injection in header                   resp=200            bytes= 161 closed=False
+half-close after headers                   resp=NO-RESP        bytes=   0 closed=True
+
+=== UTF-8 ===
+utf8 path raw                              resp=HTTP/1.1 404 Not Found bytes= 165 closed=False
+utf8 path percent-encoded                  resp=HTTP/1.1 404 Not Found bytes= 165 closed=False
+utf8 query raw                             resp=HTTP/1.1 404 Not Found bytes= 165 closed=False
+utf8 header value                          resp=200            bytes= 161 closed=False
+utf8 header name                           resp=HTTP/1.1 400 Bad Request bytes= 142 closed=True
+emoji path raw                             resp=HTTP/1.1 404 Not Found bytes= 165 closed=False
+
+=== limits / body ===
+URI 8 KiB                                  resp=HTTP/1.1 404 Not Found bytes= 165 closed=False
+URI 16 KiB                                 resp=HTTP/1.1 431 Request Header Fields Too L bytes= 167 closed=True
+header value 8 KiB                         resp=200            bytes= 161 closed=False
+40 headers (server cap 32)                 resp=200            bytes= 161 closed=False
+POST with body (len 4)                     resp=200            bytes= 161 closed=False
+POST then GET on same conn                 responses=2/2
+
+=== concurrency ===
+200 concurrent connections                 ok=200/200
+
+=== health ===
+server alive after all tests: YES
