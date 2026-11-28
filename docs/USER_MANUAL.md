@@ -29,6 +29,9 @@ cd ~/workspaces/LuaJITHttpserver
 # 从源码构建（首次会下载 LuaJIT/libuv/mbedTLS/libcurl 等）
 bash bench/build.sh
 
+# 示例配置默认写 /var/log/luajit-httpd；先建目录或改 config 里的日志路径
+mkdir -p /var/log/luajit-httpd
+
 # 运行示例配置（HTTP 0.0.0.0:8080）
 LD_LIBRARY_PATH=prefix/luajit/lib \
   prefix/c-httpd/bin/luajit-httpd src/config.example.lua
@@ -863,4 +866,4 @@ BENCH_REPEAT=3 bash bench/run.sh c-httpd
 
 当前代码使用：LuaJIT 2.1.1795687819、libuv 1.53.0、picohttpparser dd573d8（2026-10-27）、
 mbedTLS 3.6.8 LTS、libcurl 8.23.0（静态链接、mbedTLS backend）。详细版本和构建信息见
-`bench/versions-https.txt`。
+`bench/versions-https.txt`（2026-11-27 历史快照，当前版本以构建产物为准）。

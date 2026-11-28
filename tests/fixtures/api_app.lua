@@ -19,6 +19,12 @@ local function handle(req, res)
     res:write_head(200, { { "X-Queue", tostring(res:queue_size()) } }, 0)
     res:finish()
     return
+  elseif req.path == "/header-sent" then
+    local before = res:header_sent()
+    res:write_head(200, { { "X-Before", tostring(before) } })
+    res:write("after=" .. tostring(res:header_sent()))
+    res:finish()
+    return
   elseif req.path == "/204" then
     return { status = 204, headers = { { "X-No", "1" } }, body = "ignored" }
   elseif req.path == "/304" then

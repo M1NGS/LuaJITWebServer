@@ -545,10 +545,10 @@ LuaJIT 是共享库，运行时需要 `LD_LIBRARY_PATH=prefix/luajit/lib`。
 | `tests/LLM/04_mtls_sni_test.py` | per-SNI mTLS（CA 隔离、覆盖/继承） |
 | `tests/LLM/05_revocation_refresh_test.py` | 吊销表定时刷新、失败保留、启动加载、reject_all |
 | `tests/LLM/06_log_format_test.py` / `07_log_rotate_test.py` | 日志格式、异步、轮转/截断 |
-| `tests/LLM/08_http_robustness_test.py` | 畸形请求、UTF-8、限制、pipeline、200 并发 |
+| `tests/LLM/08_http_robustness_test.py` | 畸形请求、UTF-8、限制、pipeline、200 并发、idle 超时关闭 |
 | `tests/LLM/09_config_validation_test.py` | 配置校验/启动失败 |
-| `tests/LLM/10_legacy_tcp_test.py` | 旧模式、keepalive、缓冲区、SO_REUSEPORT |
-| `tests/LLM/11_lua_api_test.py` | query/headers/text(max)/header map/204/304/queue_size |
+| `tests/LLM/10_legacy_tcp_test.py` | 旧模式、keepalive、缓冲区、SO_REUSEPORT、listen 字符串/数字简写 |
+| `tests/LLM/11_lua_api_test.py` | query/headers/text(max)/header map/204/304/queue_size/header_sent |
 | `tests/LLM/12_log_sinks_test.py` | file/OTLP/syslog 三通道、过滤、批量/重试、syslog 传输 |
 | `tests/LLM/13_ffi_config_test.py` | 普通 table 隐式 FFI 配置、ABI、库/C 校验 |
 | `tests/LLM/14_reload_test.py` | `--check`、SIGHUP reload、失败回滚、listen 变化拒绝 |
@@ -562,7 +562,7 @@ LuaJIT 是共享库，运行时需要 `LD_LIBRARY_PATH=prefix/luajit/lib`。
 | `tests/LLM/22_tls_ciphers_test.py` | ciphers/ciphersuites：TLS1.2/1.3 限制、数组、默认对照、非法名称、4 worker、reload |
 | `tests/LLM/23_sni_idn_test.py` | SNI Unicode→A-label、大小写、`*.`/`**.` 通配、非法域名、4 worker |
 | `tests/HUMAN/01_req_body_tristate_test.py` | body 三态语义（人工确认） |
-| `tests/HUMAN/02_shutdown_contract_test.py` | 优雅退出契约（人工确认） |
+| `tests/HUMAN/02_shutdown_contract_test.py` | 优雅退出契约（人工确认），含第二次信号强制退出 |
 | `bench/tests/pico_robust.py` | pico/luv 辅助服务器健壮性 |
 
 运行方式和统一输出见 `tests/README.md`；历史结果在 `bench/results*/` 与 `bench/results-tests/`。

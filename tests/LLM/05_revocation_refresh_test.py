@@ -126,6 +126,16 @@ def main():
             r.case("reject_all missing file: public unaffected",
                    try_req3("public.example.test", None))
 
+        # 4) hash table growth: 3000 > initial capacity (1024)
+        big = d / "big.txt"
+        write_list(big, [f"{i:064x}" for i in range(3000)])
+        p4 = free_port()
+        with Server(config_text(p4, f, big), p4, name=NAME):
+            wait_port(p4)
+            try_req4 = make_try(p4, f)
+            r.case("large revocation table loads and serves",
+                   try_req4("b.example.test", "client-b"))
+
     r.finish()
 
 

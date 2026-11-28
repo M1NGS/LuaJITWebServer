@@ -39,6 +39,8 @@ mbedTLS 提供 HTTPS。
 
 ```bash
 bash bench/build.sh
+# 示例配置默认写 /var/log/luajit-httpd；先建目录或改 config 里的日志路径
+mkdir -p /var/log/luajit-httpd
 LD_LIBRARY_PATH=prefix/luajit/lib \
   prefix/c-httpd/bin/luajit-httpd src/config.example.lua
 ```

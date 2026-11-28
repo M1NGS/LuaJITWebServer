@@ -82,6 +82,7 @@ return {
 
     file = {
       enabled = true,
+      -- 目录需提前存在（如 mkdir -p /var/log/luajit-httpd）；不可写时启动降级为 stderr
       access = true,             -- 写 access 文件；false 关闭
       error  = true,             -- 写 error 文件；false 关闭
       access_path = "/var/log/luajit-httpd/access.log",

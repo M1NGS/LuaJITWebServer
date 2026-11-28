@@ -84,6 +84,20 @@ def main():
             r.case("SO_REUSEPORT two instances", ok == total and both_alive,
                    f"ok={ok}/{total} alive={both_alive}")
 
+    # listen 简写：host:port 字符串、纯端口字符串、数字（parse_listen_string/entry）
+    for name, make_listen in [
+        ("host:port string", lambda p: f'"127.0.0.1:{p}"'),
+        ("port string", lambda p: f'"{p}"'),
+        ("number", lambda p: f"{p}"),
+    ]:
+        port = free_port()
+        text = f"""return {{ server = {{ listen = {make_listen(port)} }},
+  log = {{ file = {{ enabled = false }} }}, app = "{APP}" }}"""
+        with Server(text, port, name=NAME + "-listen") as s:
+            st, _, b = http_request(port, "/")
+            r.case(f"listen shorthand {name}", st == 200 and b == b"Hello, World!",
+                   f"{st} {b!r}")
+
     r.finish()
 
 

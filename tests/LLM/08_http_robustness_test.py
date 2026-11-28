@@ -2,6 +2,7 @@
 """Raw-socket HTTP robustness: malformed requests, limits, UTF-8, pipeline, concurrency."""
 import socket
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
@@ -122,6 +123,25 @@ def main():
 
         data = raw_request(port, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", timeout=2)
         r.case("server alive after all tests", status_of(data) == 200)
+
+    # idle keep-alive timeout（触发 on_idle_timeout）
+    port2 = free_port()
+    with Server(http_config(port2, "limits = { idle_timeout = 1 }"), port2,
+                name=NAME + "-idle") as s:
+        sock = socket.create_connection(("127.0.0.1", port2), timeout=5)
+        sock.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
+        st, _, _ = read_response(sock)
+        sock.settimeout(3)
+        t0 = time.time()
+        try:
+            closed = sock.recv(64) == b""
+        except Exception:
+            closed = True
+        elapsed = time.time() - t0
+        sock.close()
+        r.case("idle keep-alive timeout closes connection",
+               st == 200 and closed and 0.8 <= elapsed <= 2.5,
+               f"status={st} closed={closed} elapsed={elapsed:.2f}s")
 
     r.finish()
 

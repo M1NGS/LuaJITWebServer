@@ -66,13 +66,13 @@ python3 -I tests/HUMAN/02_shutdown_contract_test.py
 | `LLM/02_tls_https_test.py` | TLS1.2/1.3、ALPN、HTTPS 上传/下载/SSE、HTTP/1.0、HEAD、pipeline、慢读、断开、明文打 TLS 端口、50 并发 |
 | `LLM/03_sni_cert_refresh_test.py` | SNI 精确名/一级通配/回退、定时 `st_mtim` 检测、旧连接保持、坏证书保留旧代、SIGHUP 不重载 |
 | `LLM/04_mtls_sni_test.py` | per-SNI mTLS：A/B 域名各自 CA、`client_auth` 覆盖、继承全局 CA、默认无 SNI |
-| `LLM/05_revocation_refresh_test.py` | 吊销表定时刷新、错误数据保留旧表、启动预加载、`reject_all` 首次加载失败 |
+| `LLM/05_revocation_refresh_test.py` | 吊销表定时刷新、错误数据保留旧表、启动预加载、`reject_all` 首次加载失败、3000 条大表扩容 |
 | `LLM/06_log_format_test.py` | nginx combined access 格式、状态码/body 字节、error `[info]`/`[warn]`、畸形请求 400 |
 | `LLM/07_log_rotate_test.py` | 定时 rotate（keep=2，`.1/.2` 分布）、`keep=0` truncate |
-| `LLM/08_http_robustness_test.py` | 畸形请求、UTF-8 路径/header、头部/URI 限制、keep-alive、pipeline、半关闭、200 并发、存活 |
+| `LLM/08_http_robustness_test.py` | 畸形请求、UTF-8 路径/header、头部/URI 限制、keep-alive、pipeline、半关闭、200 并发、存活、idle 超时 |
 | `LLM/09_config_validation_test.py` | 缺 app、TLS 配置错误、buffer 关系、TCP/日志/吊销表非法配置、端口越界、证书/app 文件缺失 |
-| `LLM/10_legacy_tcp_test.py` | 旧 `app.lua port` 模式、keepalive 定时器、SO_SNDBUF/SO_RCVBUF、`SO_REUSEPORT` 双实例 |
-| `LLM/11_lua_api_test.py` | `req.query`/`req.headers`/`req:text(max)`、header map、`queue_size`、204/304、method/path |
+| `LLM/10_legacy_tcp_test.py` | 旧 `app.lua port` 模式、keepalive 定时器、SO_SNDBUF/SO_RCVBUF、`SO_REUSEPORT` 双实例、listen 字符串/数字简写 |
+| `LLM/11_lua_api_test.py` | `req.query`/`req.headers`/`req:text(max)`、header map、`queue_size`、`header_sent`、204/304、method/path |
 | `LLM/12_log_sinks_test.py` | file/OTLP/syslog 三通道开关与过滤；OTLP protobuf 字段映射、批量/门限触发、500 重试、本地留存；syslog UDP/TCP/TLS/unix、RFC 5424/3164 |
 | `LLM/13_ffi_config_test.py` | 普通 table 配置被 C 隐式交给字节码库（`httpd_config.load`）写 log 三通道、ABI 断言、库层参数校验、C finalize 校验、平铺/方法写法兼容、无 return 的全局 config |
 | `LLM/14_reload_test.py` | `--check` 成功/语法错/缺 endpoint/缺证书/日志路径不可写/缺 app、不绑定运行中端口；SIGHUP reload 路径切换、失败回滚、listen 变化拒绝、TLS 证书重载 |
@@ -86,7 +86,7 @@ python3 -I tests/HUMAN/02_shutdown_contract_test.py
 | `LLM/22_tls_ciphers_test.py` | TLS1.2/1.3 ciphersuite 限制、字符串/数组、默认对照、非法名称启动失败、4 worker、SIGHUP 更新 |
 | `LLM/23_sni_idn_test.py` | SNI 配置 Unicode→A-label（RFC 3492）、大小写、`*.`/`**.` 通配、非法域名启动失败、4 worker |
 | `HUMAN/01_req_body_tristate_test.py` | 用户质疑的 `req.body == nil` 歧义：无 body / 小 body / 大 body 的 `has_body/body_size/streaming/buffered` 与 GET `/echo` 400 |
-| `HUMAN/02_shutdown_contract_test.py` | 用户确认的退出契约：首次 SIGINT 关闭监听/空闲连接、新连接拒绝；在飞请求受 `shutdown_timeout` 约束 |
+| `HUMAN/02_shutdown_contract_test.py` | 用户确认的退出契约：首次 SIGINT 关闭监听/空闲连接、新连接拒绝；在飞请求受 `shutdown_timeout` 约束；第二次信号立即强制退出 |
 
 ## 功能覆盖映射
 

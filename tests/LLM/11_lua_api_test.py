@@ -38,6 +38,11 @@ def main():
         q = low_headers(h, b"x-queue")
         r.case("res:queue_size header", st == 200 and q.isdigit(), f"status={st} queue={q!r}")
 
+        st, h, b = http_request(port, "/header-sent")
+        r.case("res:header_sent false before / true after",
+               st == 200 and low_headers(h, b"x-before") == b"false" and b == b"after=true",
+               f"status={st} x-before={low_headers(h, b'x-before')!r} body={b!r}")
+
         st, h, b = http_request(port, "/204")
         r.case("204 no body / CL 0",
                st == 204 and b == b"" and low_headers(h, b"content-length") in (b"0", b"-"),
