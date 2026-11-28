@@ -144,8 +144,8 @@ handler 仍由 Lua 执行；`kind="upload"` 与 C 层 multipart 上传联动。
   `uv_async` 广播；启动用 mutex 串行化配置写入 + barrier 后统一 listen。
 - 每 worker 隔离：连接、协程、listeners、日志 file sink、TLS 证书代、吊销表；全局配置/
   证书路径只读。
-- P0 限制：SIGHUP reload 拒绝；OTLP/syslog 和内置日志 rotate 在多 worker 下禁用；端口 0
-  只允许 workers=1；`max_connections` 按 worker 计算；无连接迁移。
+- 当前多 worker 限制：端口 0 只允许 workers=1；`max_connections` 按 worker 计算；
+  listen/workers 数量/日志通道开关变化需 restart；已有连接不能迁移；TLS 证书代仍每 worker 一份。
 - 测试：`tests/LLM/15_multiworker_test.py`（10 用例），全量 20 套件通过。
 - P1 已完成（2026-11-28）：per-worker SPSC ring（access 1 MiB / error 64 KiB）+ 单 collector
   按 targets 位图分发；file writer 单写者写盘/rotate；OTLP/syslog 发送线程从 collector 入队；
@@ -155,9 +155,54 @@ handler 仍由 Lua 执行；`kind="upload"` 与 C 层 multipart 上传联动。
   每 worker 只用线程局部 DRBG，4 worker 200 并发握手出现 `BAD_SIGNATURE`（仅 31 成功），
   已回退到 per-worker 证书代。mbedTLS 的 conf/pk 不能跨线程共享；若继续只能共享只读
   `mbedtls_x509_crt`/CA、pk/conf 每 worker 独立，且必须做并发握手验证。
-- P1 待做：
-  每 worker 统计与连接配额、连接分布监控。
+- P1 待做：每 worker 统计与连接配额、连接分布监控。
 - P2：`SO_ATTACH_REUSEPORT_EBPF` 按 CPU 分流（已评估，复杂度/不确定性高，暂不做）、
   绑核、jemalloc 调参、`lua_shared_dict`（业务跨 worker KV，尚未设计）。
 - P1 已完成（2026-11-28）：多 worker SIGHUP reload（control 校验 + 广播；listen/workers 数量/
   日志通道开关变化拒绝）；测试 `tests/LLM/18_multiworker_reload_test.py`。
+
+## 11. 未完成清单（2026-11-29，压缩上下文前记录）
+
+### 恢复基线
+
+- 分支 `main`，最新提交 `2a75be4`（LuaJITWebServer，已推送），工作树应保持干净。
+- 构建：`bash bench/build.sh c-httpd`；全量：`python3 -I tests/run_all.py`（当前 20/20）。
+- 关键现状：单进程多 worker（`server.workers`）、per-worker loop/VM/listener、control loop、
+  per-worker ring + 单 collector + file writer、吊销表共享、workers>1 SIGHUP reload 已完成。
+- 用户明确要求：**不要主动压测**（2026-11-27 起），除非重新授权；`bench/results*` 仅历史参考。
+
+### 高优先级
+
+- [ ] TLS 材料安全共享：共享只读 `mbedtls_x509_crt`/CA，`pk`/`conf`/DRBG 每 worker 独立；
+  合并前必须做 4 worker × 200 并发握手验证。共享整个 `ssl_config`+`pk` 已实测并发
+  `BAD_SIGNATURE`，不可行（见第 10 节）。
+- [ ] `routes`/`uploader` 配置（第 3 节）：先定格式（path/method/kind/handler），C 编译路由表，
+  Lua handler 绑定，`kind="upload"` 与 multipart 联动。
+- [ ] C 层流式 multipart 上传（第 1 节 P1，尚未开始）。
+
+### 协议 / 功能
+
+- [ ] SNI IDN：RFC 3492 Punycode 编码/转换；多级通配需先定语义（当前仅 `*.suffix` 一级）。
+- [ ] `tls.ciphers` / `ciphersuites`：按 mbedTLS 3.6 API 映射 TLS 1.2/1.3 ID；非法名称启动报错。
+- [ ] HTTP/2：ALPN h2、帧解析、HPACK、流状态机、流控、与协程/背压/优雅退出集成；
+  独立模块，不是现有 HTTP/1.1 状态机的补丁。
+
+### 多 worker / 日志收尾
+
+- [ ] `workers=1` 仍走旧的 per-worker `log_sink`（reload 日志路径切换依赖它）；统一迁移到
+  ring+collector 后删除双路径死代码。
+- [ ] 多 worker reload 的应用阶段不是全局事务：control 校验通过后若某 worker app 加载失败，
+  该 worker 保留旧 app/TLS（文档已写明）；如需严格回滚要再做全 worker 事务。
+- [ ] 每 worker 统计/连接配额、连接分布监控；绑核、jemalloc 调参。
+- [ ] `lua_shared_dict`（业务跨 worker KV）尚未设计。
+- [ ] 日志 P2：OTLP gzip / partial success / 多 endpoint；syslog RFC 5424 STRUCTURED-DATA、
+  UDP 分片；`file` 通道统一到新管道后清理旧 sink。
+- [ ] 吊销表 P2：libpq native provider（当前只有 mock_file）、`reject_all` 启动失败测试、
+  刷新指标。
+
+### 已决策不做 / 已完成
+
+- [x] eBPF `SO_ATTACH_REUSEPORT_EBPF` 按 CPU 分流：复杂度/不确定性高，**决定不做**。
+- [x] chunked 请求体：`tests/LLM/17_chunked_request_test.py`。
+- [x] workers>1 SIGHUP reload：`tests/LLM/18_multiworker_reload_test.py`。
+- [x] 日志三通道/rotate、吊销表共享、多 worker 基础架构。
