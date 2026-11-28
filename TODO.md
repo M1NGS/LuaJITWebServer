@@ -1,9 +1,22 @@
 # TODO
 
-## 1. C 层流式 multipart 上传（调研完成，待实现）
+## 1. C 层流式 multipart 上传（P1 已完成 2026-11-29）
 
 目标：像 nginx-upload-module 一样，由 C 层完成 `multipart/form-data` 的流式解析与落盘，
 Lua 只拿字段和文件元数据，不在 Lua 层做流式解析。
+
+已完成（P1）：
+- vendor `zhaozg/multipart-parser-c` pin `af38fe4`（MIT，`build.sh` 克隆 + 只编译 .c/.h）
+- CL/chunked 双模式单遍喂解析器；`req.multipart`、`req.fields`、`req.files`
+  （field/filename/content_type/size/path）；`req.body=nil`、`read()`/`text()` 返回 nil；
+  解析完成后才 dispatch handler
+- `HTTPD_UPLOAD_DIR`（默认 `/tmp/luajit-httpd-upload`，启动 0700 创建）、`mkstemp` 0600；
+  单文件/字段总量/文件数软限（超限省略但继续解析）；总 body 413；坏请求 400；写盘失败 507
+- 清理：响应完成/keep-alive reset/连接关闭统一 unlink；handler 可 rename 保留
+- 测试 `tests/LLM/20_multipart_upload_test.py`（25 用例，含 chunked、软限、中断清理、
+  keep-alive、4 worker 16 并发）；全量 22/22
+
+P2 待做：C 增量 SHA1、`uv_fs_write` 异步写盘、RFC 5987 `filename*`。
 
 ### 设计要点
 
@@ -31,18 +44,17 @@ Lua 只拿字段和文件元数据，不在 Lua 层做流式解析。
 
 ### 分期
 
-- P1：vendor 解析器 + 头识别/boundary 校验 + 单遍解析落盘 + `req.fields`/`req.files` +
-  上限 + 清理 + 测试（多文件、多字段、二进制数据、boundary 跨块、格式错误、磁盘写失败、
-  客户端中途断开、大文件内存曲线）
+- P1（已完成）：vendor 解析器 + 头识别/boundary 校验 + 单遍解析落盘 + `req.fields`/`req.files`
+  + 上限 + 清理 + 测试（多文件、多字段、二进制、boundary 跨块、格式错误、客户端中断、
+  软限、chunked、4 worker 并发）
 - P2：C 增量 SHA1、`uv_fs_write` 异步写盘、RFC 5987 `filename*`
-  （chunked 请求体已完成 2026-11-28：CL/chunked 双模式、trailer 丢弃、跨包/畸形校验）
 
-### 待决
+### 已定
 
-- 鉴权时序（解析后 Lua 校验 vs 头阶段 Lua 预检）
-- 哈希放 C（写盘时增量算）还是 Lua（事后读文件）
-- 同步写盘先上（nginx 同款）还是直接做 `uv_fs_write` 协程化
-- 清理策略（统一 unlink vs 显式 keep API）
+- 鉴权时序：C 解析完才 dispatch，token 校验在 Lua handler 里做，失败返回错误码，C 清理
+- 哈希：P2 放 C 写盘时增量算（当前不做）
+- 写盘：P1 同步（与 nginx 一致），P2 再协程化
+- 清理：统一 unlink（handler 需要保留就 `os.rename` 到自己的目录）
 
 ### 参考
 
@@ -186,7 +198,8 @@ handler 仍由 Lua 执行；`kind="upload"` 与 C 层 multipart 上传联动。
   （见第 10 节；整代共享已因 `BAD_SIGNATURE` 否决）。
 - [ ] `routes`/`uploader` 配置（第 3 节）：先定格式（path/method/kind/handler），C 编译路由表，
   Lua handler 绑定，`kind="upload"` 与 multipart 联动。
-- [ ] C 层流式 multipart 上传（第 1 节 P1，尚未开始）。
+- [x] C 层流式 multipart 上传（2026-11-29，第 1 节）：`tests/LLM/20_multipart_upload_test.py`；
+  P2 剩 `filename*`/增量 SHA1/异步写盘。
 
 ### 协议 / 功能
 

@@ -406,6 +406,9 @@ return { handle = handle }
 | `req.streaming` | body 超过自动缓冲阈值或为 chunked（此时 `req.body` 为 nil） |
 | `req.chunked` | 请求体是否为 `Transfer-Encoding: chunked` |
 | `req.body` | 小 body（<= 1 MiB）为字符串；流式/chunked/无 body 为 nil |
+| `req.multipart` | 是否为 C 层解析的 `multipart/form-data` 请求 |
+| `req.fields` | multipart 普通字段表：`name -> value`（同名后者覆盖） |
+| `req.files` | multipart 文件数组，见 5.1.1 |
 
 读取请求体：
 
@@ -434,6 +437,53 @@ end
   支持 chunk extensions（忽略）和 trailer（丢弃）。
 - 只接受单个 `chunked` coding；其他 coding、HTTP/1.0 的 TE、TE 与 CL 同时出现都返回 400；
   畸形 chunk size/终止符/trailer 超限返回 400；解码后总量超过 `limits.max_body` 返回 413。
+
+### 5.1.1 multipart/form-data 上传（C 层）
+
+`Content-Type: multipart/form-data` 的请求由 C 层单遍流式解析并落盘，**解析完成后才调用
+`handle`**；普通字段留在内存，文件写入 `HTTPD_UPLOAD_DIR`（默认 `/tmp/luajit-httpd-upload`，
+启动时以 0700 创建）下的 `upload-XXXXXX`（`mkstemp`，0600）。
+
+| 字段 | 说明 |
+|---|---|
+| `req.multipart` | 恒为 `true` |
+| `req.fields` | 普通字段表 `name -> value`；同名后者覆盖，空值为 `""` |
+| `req.files` | 数组，每项 `{ field, filename, content_type, size, path }`；`filename` 已取 basename |
+| `req.body` | `nil` |
+| `req:read()` / `req:text()` | 返回 `nil`（body 已由 C 层消费） |
+
+```lua
+local function handle(req, res)
+  if req.multipart then
+    for k, v in pairs(req.fields) do
+      -- 普通字段
+    end
+    for _, f in ipairs(req.files) do
+      -- f.path 是临时文件；响应完成/连接关闭后服务端会 unlink。
+      -- 需要保留时自己移走：
+      -- os.rename(f.path, "/srv/uploads/" .. f.filename)
+    end
+    return { status = 200, body = "ok" }
+  end
+  return { status = 400, body = "expected multipart" }
+end
+```
+
+限制与环境变量（都可调小，不能突破代码内硬上限）：
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `HTTPD_UPLOAD_DIR` | `/tmp/luajit-httpd-upload` | 临时文件目录；启动时创建/校验 |
+| `HTTPD_UPLOAD_MAX_FILE` | 64 MiB | 单文件软限；超限文件被省略，继续解析 |
+| `HTTPD_UPLOAD_MAX_FIELD_BYTES` | 256 KiB | 非文件字段总量；超限字段被省略 |
+| `HTTPD_UPLOAD_MAX_FILES` | 32 | 文件数上限（硬上限 32）；超出被省略 |
+
+- 总 body 仍受 `limits.max_body`/`HTTPD_MAX_BODY` 限制（CL 或 chunked 解码后），超限 413。
+- part 头上限 8 KiB；boundary 1–70 字节，支持 quoted（`boundary="x y"`）；多余参数忽略。
+- 畸形 boundary/part 头/缺 `Content-Disposition` 或 `name` → 400；临时文件创建/写入失败 → 507；
+  内存不足 → 500。
+- 鉴权在 handler 拿到完整字段/文件后做；返回 403 等错误时 C 层会清理临时文件。
+- P1 为同步写盘（与 nginx 一致）；尚未实现 RFC 5987 `filename*`、写盘时增量 SHA1、异步落盘。
 
 ### 5.2 res 方法
 
@@ -744,8 +794,8 @@ BENCH_REPEAT=3 bash bench/run.sh c-httpd
 
 - 只支持 HTTP/1.1；不支持 HTTP/2。
 - 请求体支持 Content-Length 和 `Transfer-Encoding: chunked`（仅 chunked coding；其他 TE、HTTP/1.0 TE、CL+TE 返回 400）。
+- `multipart/form-data` 由 C 层流式解析（见 5.1.1）：同步写盘；暂无 `filename*`、增量 SHA1、异步落盘。
 - `routes` 配置尚未实现；路由在 `app.lua` 内自己判断。`uploader` 只是透传业务配置。
-- C 层 multipart 上传尚未实现（见 `TODO.md`）。
 - SNI 不支持 IDN Unicode 自动转换和多级通配；配置写 Punycode/精确名。
 - `tls.ciphers` / `ciphersuites` 暂未应用。
 - 吊销表 provider 目前只有 mock 文件；pgsql native 待接。

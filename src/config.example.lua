@@ -145,5 +145,7 @@ return {
   },
 
   -- 业务配置：C 不解释，Lua 里通过全局 config 读取
+  -- multipart/form-data 由 C 层自动解析（req.fields / req.files）；临时目录与软限用环境变量：
+  -- HTTPD_UPLOAD_DIR、HTTPD_UPLOAD_MAX_FILE、HTTPD_UPLOAD_MAX_FIELD_BYTES、HTTPD_UPLOAD_MAX_FILES
   uploader = { uri = "http://127.0.0.1:9000/upload" },
 }

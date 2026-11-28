@@ -15,8 +15,8 @@
   客户端证书吊销表、固定格式异步日志、优雅退出
 
 当前版本支持 HTTP/1.1（含 keep-alive/pipeline）、HTTP/1.0 close 定界、请求体
-Content-Length 与 `Transfer-Encoding: chunked`；不支持 HTTP/2、`routes` 配置和
-C 层 multipart 上传（见第 12 节）。
+Content-Length 与 `Transfer-Encoding: chunked`、C 层 `multipart/form-data` 流式上传；
+不支持 HTTP/2 和 `routes` 配置（见第 12 节、第 18 节）。
 
 ## 2. 总体架构
 
@@ -130,6 +130,27 @@ A/B 方式，避免阻塞事件循环。
 - Content-Length > `limits.max_body`（默认 128 MiB，`HTTPD_MAX_BODY` 可覆盖）在 handler 启动前 413；
   chunked 总量在解码过程中检查。
 - `MAX_BODY_STREAM` 的语义是“总请求体上限”，不是单次内存上限。
+
+### 6.1 multipart/form-data（C 层流式）
+
+- 解析：`try_parse_head` 识别 `Content-Type: multipart/form-data` 并提取 boundary
+  （1–70 字节，支持 quoted；缺/非法 400）。`request_t.mp` 分配 `multipart_ctx_t`，
+  `multipart_parser_settings` 嵌在 ctx 里（parser 只保存指针，**不能放栈上**）。
+- 单遍：`consume_body`（CL）与 `consume_chunked` 的 data 状态把解码后的字节直接喂
+  `multipart_parser_execute`，不再交付 Lua；handler 在终止 boundary + body 结束后才启动。
+  `req.multipart=true`、`req.fields`/`req.files` 由 `mp_publish_req` 发布；
+  `read`/`text` 替换为返回 nil 的 C 函数，`body=nil`、`streaming=false`。
+- 落盘：part 头解析出 `filename` 即创建 `mkstemp(upload_dir/upload-XXXXXX)`（0600），
+  part 数据同步 `write` 循环；普通字段在内存（动态增长）。文件名取 basename。
+- 限制：总 body 走 `max_body_stream`（CL 在头阶段、chunked 在解码时、feed 再校验一次 → 413）；
+  单文件 `HTTPD_UPLOAD_MAX_FILE`（默认 64 MiB）、字段总量 `HTTPD_UPLOAD_MAX_FIELD_BYTES`
+  （256 KiB）、文件数 `HTTPD_UPLOAD_MAX_FILES`（默认/硬上限 32）。超软限的字段/文件从结果中
+  省略但继续解析；part 头 8 KiB；磁盘创建/写失败 507，内存失败 500。
+- 清理：`request_free_buffers` 调 `mp_ctx_free`，关闭并 unlink 所有临时文件（handler 已
+  rename 到别处的原路径 unlink 失败无害）；keep-alive 的 `request_reset` 与连接关闭都走这里。
+  鉴权在完整解析后的 handler 内做，错误响应同样触发清理。
+- 多 worker：`multipart_ctx_t` 属于连接/worker，无共享；上传目录进程级共享，`mkstemp`
+  保证文件名不冲突。P1 用同步写盘（阻塞 loop），后续可改 `uv_fs_write` 协程化。
 
 ## 7. Lua 运行时与分发
 
@@ -482,7 +503,8 @@ libuv 没有内建优雅退出；`uv_stop` 只停止 loop。实现为应用层�
 | luv | rocks install |
 | libuv | 1.53.0（静态） |
 | picohttpparser | dd573d8 2026-10-27 |
-| mbedTLS | 3.6.8 LTS（静态） |
+| multipart-parser-c | af38fe4（MIT，zhaozg fork；仅编译 .c/.h） |
+| mbedTLS | 3.6.8 LTS（静态，`MBEDTLS_THREADING_C`+PTHREAD） |
 | wrk | 4.1.0（自编译） |
 
 WSL 工作目录：`~/workspaces/LuaJITHttpserver`（与项目目录同名）。
@@ -518,6 +540,7 @@ LuaJIT 是共享库，运行时需要 `LD_LIBRARY_PATH=prefix/luajit/lib`。
 | `tests/LLM/17_chunked_request_test.py` | chunked 上传/回显、trailer、跨包、TE 校验、丢弃后 keep-alive、413 |
 | `tests/LLM/18_multiworker_reload_test.py` | 多 worker SIGHUP：app/日志路径/TLS 证书重载、拒绝变化 |
 | `tests/LLM/19_tls_shared_material_test.py` | 4 worker 共享证书材料：200 并发 TLS1.2/1.3 握手、reload 后代际并发 |
+| `tests/LLM/20_multipart_upload_test.py` | C 层 multipart：字段/文件、quoted boundary、chunked、软限、400/413、清理、keep-alive、4 worker 并发 |
 | `tests/HUMAN/01_req_body_tristate_test.py` | body 三态语义（人工确认） |
 | `tests/HUMAN/02_shutdown_contract_test.py` | 优雅退出契约（人工确认） |
 | `bench/tests/pico_robust.py` | pico/luv 辅助服务器健壮性 |
@@ -552,13 +575,13 @@ WSL 抖动较大，历史数值仅作量级参考；当前版本未重新做完�
 当前限制：
 
 - HTTP/1.1 only；无 HTTP/2
-- 请求体支持 Content-Length 和 `Transfer-Encoding: chunked`（仅单个 chunked coding）
+- 请求体支持 Content-Length、`Transfer-Encoding: chunked`（仅单个 chunked coding）、
+  C 层 multipart（同步写盘；无 `filename*`、增量 SHA1、异步落盘）
 - 无 `routes` 配置（路由在 app.lua 内自己判断）；`uploader` 只是透传业务配置
-- C 层 multipart 上传未实现（见 `TODO.md`）
 - SNI 不支持 IDN/多级通配；`tls.ciphers` 未应用
 - 吊销表 provider 仅 mock；libpq native 待接
 - 吊销只影响新握手；不断开已建立连接；会话恢复不重新校验证书
 - CPU-bound handler 阻塞 loop，也会延迟优雅退出
 
-后续方向（`TODO.md`）：C 层 multipart 上传、路由/uploader 配置、libpq native、
-`tls.ciphers`、HTTP/2、高并发握手线程池。
+后续方向（`TODO.md`）：路由/uploader 配置、multipart P2（`filename*`/SHA1/异步写盘）、
+libpq native、`tls.ciphers`、HTTP/2、高并发握手线程池。

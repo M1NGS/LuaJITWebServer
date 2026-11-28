@@ -50,6 +50,22 @@
 - 吊销表是进程级共享表（`g_revoked` 原子指针 + 引用计数）；验证回调必须 load+ref/unref，
   旧表进入 retire 队列由定时器回收，不要直接在 worker 线程 free 大表。
 
+## multipart 上传（C 层）
+
+- 解析器 vendor `zhaozg/multipart-parser-c`，pin `af38fe4`；`bench/build.sh` 的
+  `build_multipart` 负责 clone，`c-httpd` 目标编译其 `multipart_parser.c`。
+  改 pin/构建方式前先更新 `tests/LLM/20_multipart_upload_test.py`。
+- `multipart_parser_settings` 必须放在 `multipart_ctx_t` 内（parser 只保存指针）；
+  2026-11-29 放 `mp_init` 栈上导致解析时 stack-use-after-return / SIGSEGV。
+- 临时文件在 `HTTPD_UPLOAD_DIR` 下用 `mkstemp` 创建；清理统一在
+  `request_free_buffers() → mp_ctx_free()`（keep-alive reset、连接关闭、错误路径都会走到），
+  不要在各分支单独 unlink。handler 需要保留时用 `os.rename`。
+- 软限：单文件 `HTTPD_UPLOAD_MAX_FILE`、字段总量 `HTTPD_UPLOAD_MAX_FIELD_BYTES`、文件数
+  `HTTPD_UPLOAD_MAX_FILES`（硬上限 32）；超限字段/文件从结果省略但继续解析。
+  总 body 仍走 `max_body_stream`（413）。P1 同步写盘（阻塞 loop），P2 再改异步。
+- multipart 请求在解析完成前不 dispatch handler；`req.body=nil`，`req:read()`/`req:text()`
+  被替换为返回 nil 的 C 函数。改动解析/交付路径后跑 `tests/LLM/20_multipart_upload_test.py`。
+
 ## 依赖与构建
 
 - 本项目在 WSL 内的工作目录是 `~/workspaces/LuaJITHttpserver`（与项目目录同名），Linux 侧的源码、构建产物和脚本都放在这里。

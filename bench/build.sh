@@ -108,6 +108,17 @@ build_pico() {
   cp "$SRC/picohttpparser/picohttpparser.h" "$PREFIX/pico/lib/"
 }
 
+build_multipart() {
+  local d="$SRC/multipart-parser-c"
+  if [ ! -d "$d/.git" ]; then
+    git clone -q https://github.com/zhaozg/multipart-parser-c.git "$d"
+  fi
+  # pin commit（MIT；只 vendored multipart_parser.c/.h）
+  git -C "$d" checkout -q af38fe431fa1535d73a04a599a53d0489392e7bc
+  log "multipart-parser-c @ $(git -C "$d" rev-parse --short HEAD)"
+  test -f "$d/multipart_parser.c"
+}
+
 build_mbedtls() {
   local d="$SRC/mbedtls"
   if [ ! -f "$d/CMakeLists.txt" ]; then
@@ -177,9 +188,13 @@ build_c_httpd() {
   if [ ! -f "$PREFIX/curl/lib/libcurl.a" ]; then
     build_curl
   fi
+  if [ ! -f "$SRC/multipart-parser-c/multipart_parser.c" ]; then
+    build_multipart
+  fi
   run c-httpd gcc -O2 -DNDEBUG -o "$out/luajit-httpd" \
     "$ROOT/src/httpd.c" "$SRC/picohttpparser/picohttpparser.c" \
-    -I"$SRC/picohttpparser" -I"$PREFIX/libuv/include" -I"$LUAJIT/include/luajit-2.1" \
+    "$SRC/multipart-parser-c/multipart_parser.c" \
+    -I"$SRC/picohttpparser" -I"$SRC/multipart-parser-c" -I"$PREFIX/libuv/include" -I"$LUAJIT/include/luajit-2.1" \
     -I"$PREFIX/mbedtls/include" -I"$PREFIX/curl/include" \
     -L"$PREFIX/libuv/lib" -L"$LUAJIT/lib" -L"$PREFIX/mbedtls/lib" -L"$PREFIX/curl/lib" \
     -lluajit-5.1 -luv -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lm -ldl -lpthread -lrt
@@ -187,7 +202,7 @@ build_c_httpd() {
 
 targets=("$@")
 if [ ${#targets[@]} -eq 0 ]; then
-  targets=(luajit luarocks luv wrk libuv pico mbedtls curl c-httpd)
+  targets=(luajit luarocks luv wrk libuv pico multipart mbedtls curl c-httpd)
 fi
 for t in "${targets[@]}"; do
   log ">>> build $t"

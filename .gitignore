@@ -10,6 +10,7 @@ src/mbedtls/
 src/luarocks/
 src/wrk/
 src/picohttpparser/
+src/multipart-parser-c/
 src/*/build/
 
 *.o

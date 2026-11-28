@@ -29,6 +29,9 @@
  *   req.body           小 body（<= AUTO_BUFFER_BODY）时为完整字符串；流式时为 nil
  *   req:read()         协程式读取下一块请求体，返回 chunk 或 nil（body 结束）
  *   req:text(max?)     协程式聚合整个 body：小 body 直接返回 req.body，大 body 逐块拼接
+ *   req.multipart      multipart/form-data（C 层已解析）；req.body=nil、read/text 返回 nil
+ *   req.fields         multipart 普通字段表；req.files = {field,filename,content_type,size,path}
+ *                      path 为临时文件，请求结束会 unlink；需要保留请 rename
  *
  *   res:write_head(status?, headers?, content_length?)
  *                       给 content_length → Content-Length 模式；否则 HTTP/1.1 chunked、HTTP/1.0 close 定界
@@ -81,6 +84,7 @@
 #include <mbedtls/net_sockets.h>
 
 #include "picohttpparser.h"
+#include "multipart_parser.h"
 #include "httpd_config.h"
 #include "config_cdef_bc.h"
 #include "httpd_config_bc.h"
@@ -91,6 +95,12 @@
 /* 流式 body 上限，默认对齐 Bun.serve 的 maxRequestBodySize（128 MiB）；HTTPD_MAX_BODY 可覆盖 */
 #define MAX_BODY_STREAM_DEFAULT (128ULL * 1024 * 1024)
 static size_t max_body_stream = MAX_BODY_STREAM_DEFAULT;
+
+/* multipart 上传：临时目录与软限制（HTTPD_UPLOAD_* 环境变量可覆盖） */
+static char g_upload_dir[512] = "/tmp/luajit-httpd-upload";
+static size_t g_upload_max_file = 64ULL * 1024 * 1024;
+static size_t g_upload_max_field_bytes = 256 * 1024;
+static size_t g_upload_max_files = 32;
 #define READ_HIGH_WATER    (1024 * 1024)             /* 未交付 body 缓冲高水位（默认） */
 #define WRITE_HIGH_WATER   (8 * 1024 * 1024)
 #define WRITE_LOW_WATER    (256 * 1024)
@@ -554,6 +564,71 @@ typedef enum {
   RESP_CLOSE,    /* HTTP/1.0，close 定界 */
 } resp_mode_t;
 
+/* ---------- multipart/form-data（C 层流式解析，落盘临时文件） ---------- */
+#define MP_BOUNDARY_MAX 70
+#define MP_PART_HEADER_MAX (8 * 1024)
+#define MP_MAX_FIELDS 128
+#define MP_MAX_FILES 32
+#define MP_MAX_NAME 256
+#define MP_MAX_FILENAME 256
+#define MP_MAX_CTYPE 128
+#define MP_MAX_DISPOSITION 1024
+#define MP_MAX_HEADER_VALUE 2048
+
+typedef struct mp_field_s {
+  char *name; size_t name_len;
+  char *value; size_t value_len;
+} mp_field_t;
+
+typedef struct mp_file_s {
+  char *field; size_t field_len;
+  char *filename; size_t filename_len;
+  char *ctype; size_t ctype_len;
+  char *path;                 /* mkstemp 路径；handler 可 rename 保留 */
+  int fd;                     /* 写入中 >=0；part 结束后 -1 */
+  size_t size;
+  int omitted;                /* 超过软限/文件数，结果中省略 */
+} mp_file_t;
+
+typedef struct multipart_ctx_s {
+  multipart_parser *parser;
+  multipart_parser_settings settings;  /* parser 只保存指针，必须与 ctx 同寿命 */
+  conn_t *c;
+  char boundary[MP_BOUNDARY_MAX + 2];
+
+  int body_end;               /* 收到终止 boundary */
+  int dispatched;             /* handler 已启动 */
+  int error_status;           /* 0 / 400 / 413 / 500 / 507 */
+  char error_msg[128];
+  size_t total;               /* 已喂入解析器的解码 body 字节 */
+
+  /* 当前 part 头累积 */
+  char hdr_name[64]; size_t hdr_name_len;
+  char hdr_value[MP_MAX_HEADER_VALUE]; size_t hdr_value_len;
+  int in_header_value;
+  size_t header_bytes;
+  char disposition[MP_MAX_DISPOSITION]; size_t disposition_len;
+  char part_ctype[MP_MAX_CTYPE]; size_t part_ctype_len;
+  int saw_disposition;
+  int part_has_filename;
+  char part_name[MP_MAX_NAME]; size_t part_name_len;
+  char part_filename[MP_MAX_FILENAME]; size_t part_filename_len;
+
+  /* 当前 part 数据 */
+  int in_part;
+  int part_is_file;
+  int cur_file;               /* files 下标；-1 = 普通字段 */
+  int value_omitted;
+  char *value; size_t value_len, value_cap;
+
+  mp_field_t fields[MP_MAX_FIELDS];
+  size_t n_fields;
+  size_t field_bytes;
+
+  mp_file_t files[MP_MAX_FILES];
+  size_t n_files;
+} multipart_ctx_t;
+
 typedef struct request_s {
   conn_t *c;
   int co_ref;
@@ -587,6 +662,10 @@ typedef struct request_s {
   int chunk_state;           /* 0=size,1=data,2=CRLF,3=trailer,4=done */
   size_t chunk_remaining;
   size_t chunk_total;
+
+  int multipart;             /* Content-Type: multipart/form-data */
+  char mp_boundary[MP_BOUNDARY_MAX + 2];
+  multipart_ctx_t *mp;
 
   resp_mode_t mode;
   int head_sent;
@@ -661,6 +740,10 @@ static int tls_flush_out(conn_t *c);
 static void tls_pump(conn_t *c);
 static void tls_gen_ref(tls_gen_t *g);
 static void tls_gen_unref(tls_gen_t *g);
+static void mp_ctx_free(request_t *r);
+static void mp_publish_req(request_t *r);
+static int mp_feed(conn_t *c, const char *data, size_t len);
+static void mp_complete(conn_t *c);
 
 static const char *STREAM_LIB_LUA =
   "local M = {}\n"
@@ -1175,7 +1258,8 @@ static int log_ring_write(log_ring_t *r, const log_event_t *ev)
     r->notify_count = 0;
     if (g_log_eventfd >= 0) {
       uint64_t one = 1;
-      (void)write(g_log_eventfd, &one, sizeof(one));
+      ssize_t wr = write(g_log_eventfd, &one, sizeof(one));
+      (void)wr;
     }
   }
   return 0;
@@ -1633,7 +1717,8 @@ static void log_pipeline_stop(void)
   __atomic_store_n(&g_log_stop, 1, __ATOMIC_RELEASE);
   if (g_log_eventfd >= 0) {
     uint64_t one = 1;
-    (void)write(g_log_eventfd, &one, sizeof(one));
+    ssize_t wr = write(g_log_eventfd, &one, sizeof(one));
+    (void)wr;
   }
   uv_thread_join(&g_log_collector_thread);
   log_file_writer_stop();
@@ -3011,6 +3096,7 @@ static void request_free_buffers(request_t *r)
   r->body_buf = NULL;
   r->body_len = 0;
   r->body_cap = 0;
+  mp_ctx_free(r);
 }
 
 static void on_conn_close(uv_handle_t *h)
@@ -3588,7 +3674,7 @@ static void push_req_table(conn_t *c)
   lua_setfield(co, -2, "has_body");
   lua_pushinteger(co, (lua_Integer)(r->chunked ? 0 : r->body_cl));
   lua_setfield(co, -2, "body_size");
-  lua_pushboolean(co, r->chunked || r->body_cl > g_auto_buffer_body);
+  lua_pushboolean(co, r->multipart ? 0 : (r->chunked || r->body_cl > g_auto_buffer_body));
   lua_setfield(co, -2, "streaming");
   lua_pushboolean(co, r->chunked);
   lua_setfield(co, -2, "chunked");
@@ -3605,6 +3691,7 @@ static void push_req_table(conn_t *c)
   lua_getfield(co, -1, "text");
   lua_remove(co, -2);
   lua_setfield(co, -2, "text");
+  if (r->multipart) mp_publish_req(r);
 }
 
 static int res_write_head(lua_State *lua);
@@ -3857,6 +3944,619 @@ static int res_set_timeout(lua_State *lua)
   return 0;
 }
 
+/* ---------- multipart/form-data：C 层流式解析、字段/文件、临时文件 ---------- */
+
+static void mp_ctx_free(request_t *r)
+{
+  multipart_ctx_t *mp = r->mp;
+  if (!mp) return;
+  for (size_t i = 0; i < mp->n_files; i++) {
+    mp_file_t *f = &mp->files[i];
+    if (f->fd >= 0) close(f->fd);
+    if (f->path) {
+      unlink(f->path);
+      free(f->path);
+    }
+    free(f->field);
+    free(f->filename);
+    free(f->ctype);
+  }
+  for (size_t i = 0; i < mp->n_fields; i++) {
+    free(mp->fields[i].name);
+    free(mp->fields[i].value);
+  }
+  free(mp->value);
+  if (mp->parser) multipart_parser_free(mp->parser);
+  free(mp);
+  r->mp = NULL;
+}
+
+static void mp_set_error(multipart_ctx_t *mp, int status, const char *fmt, ...)
+{
+  if (!mp || mp->error_status) return;
+  mp->error_status = status;
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(mp->error_msg, sizeof(mp->error_msg), fmt, ap);
+  va_end(ap);
+}
+
+static const char *mp_skip_ows(const char *p, const char *end)
+{
+  while (p < end && (*p == ' ' || *p == '\t')) p++;
+  return p;
+}
+
+/* 读取参数值：quoted-string（支持 \\ 和 \" 转义）或 token */
+static int mp_read_param_value(const char **pp, const char *end,
+                               char *out, size_t cap, size_t *out_len)
+{
+  const char *p = mp_skip_ows(*pp, end);
+  size_t n = 0;
+  if (p < end && *p == '"') {
+    p++;
+    while (p < end && *p != '"') {
+      char ch = *p++;
+      if (ch == '\\' && p < end) ch = *p++;
+      if (n >= cap) return -1;
+      out[n++] = ch;
+    }
+    if (p >= end || *p != '"') return -1;
+    p++;
+  } else {
+    while (p < end && *p != ';' && !isspace((unsigned char)*p)) {
+      if (n >= cap) return -1;
+      out[n++] = *p++;
+    }
+    if (n == 0) return -1;
+  }
+  *out_len = n;
+  *pp = p;
+  return 0;
+}
+
+/* Content-Type: multipart/form-data; boundary=...；成功返回 0 */
+static int mp_parse_boundary(const char *v, size_t n, char *out, size_t cap)
+{
+  const char *p = v, *end = v + n;
+  const char *type = "multipart/form-data";
+  size_t tl = strlen(type);
+  p = mp_skip_ows(p, end);
+  if ((size_t)(end - p) < tl || strncasecmp(p, type, tl) != 0) return -1;
+  p += tl;
+
+  int found = 0;
+  while (p < end) {
+    p = mp_skip_ows(p, end);
+    if (p >= end) break;
+    if (*p != ';') return -1;
+    p++;
+    p = mp_skip_ows(p, end);
+    if (p >= end) break;
+    const char *nm = p;
+    while (p < end && *p != '=' && *p != ';') p++;
+    size_t nml = (size_t)(p - nm);
+    while (nml && isspace((unsigned char)nm[nml - 1])) nml--;
+    if (nml == 0 || p >= end || *p != '=') return -1;
+    p++;
+    char val[MP_BOUNDARY_MAX + 8];
+    size_t vl = 0;
+    if (mp_read_param_value(&p, end, val, sizeof(val), &vl) != 0) return -1;
+    if (nml == 8 && strncasecmp(nm, "boundary", 8) == 0) {
+      if (found || vl == 0 || vl > MP_BOUNDARY_MAX || vl >= cap) return -1;
+      for (size_t i = 0; i < vl; i++) {
+        unsigned char ch = (unsigned char)val[i];
+        if (ch < 0x20 || ch > 0x7e || ch == '"') return -1;
+      }
+      memcpy(out, val, vl);
+      out[vl] = 0;
+      found = 1;
+    }
+  }
+  return found ? 0 : -1;
+}
+
+/* Content-Disposition: form-data; name="x"; filename="y" */
+static int mp_parse_disposition(multipart_ctx_t *mp)
+{
+  const char *p = mp->disposition, *end = p + mp->disposition_len;
+  const char *type = "form-data";
+  size_t tl = strlen(type);
+  p = mp_skip_ows(p, end);
+  if ((size_t)(end - p) < tl || strncasecmp(p, type, tl) != 0) return -1;
+  p += tl;
+  int have_name = 0;
+
+  while (p < end) {
+    p = mp_skip_ows(p, end);
+    if (p >= end) break;
+    if (*p != ';') return -1;
+    p++;
+    p = mp_skip_ows(p, end);
+    if (p >= end) break;
+    const char *nm = p;
+    while (p < end && *p != '=' && *p != ';') p++;
+    size_t nml = (size_t)(p - nm);
+    while (nml && isspace((unsigned char)nm[nml - 1])) nml--;
+    if (nml == 0 || p >= end || *p != '=') return -1;
+    p++;
+    char val[MP_MAX_DISPOSITION];
+    size_t vl = 0;
+    if (mp_read_param_value(&p, end, val, sizeof(val), &vl) != 0) return -1;
+    if (nml == 4 && strncasecmp(nm, "name", 4) == 0) {
+      if (vl >= MP_MAX_NAME) return -1;
+      memcpy(mp->part_name, val, vl);
+      mp->part_name[vl] = 0;
+      mp->part_name_len = vl;
+      have_name = 1;
+    } else if (nml == 8 && strncasecmp(nm, "filename", 8) == 0) {
+      size_t base = 0;
+      for (size_t i = 0; i < vl; i++) {
+        if (val[i] == '/' || val[i] == '\\') base = i + 1;
+      }
+      if (vl - base >= MP_MAX_FILENAME) return -1;
+      memcpy(mp->part_filename, val + base, vl - base);
+      mp->part_filename[vl - base] = 0;
+      mp->part_filename_len = vl - base;
+      mp->part_has_filename = 1;
+    }
+  }
+  return have_name ? 0 : -1;
+}
+
+static void mp_header_pair(multipart_ctx_t *mp)
+{
+  if (mp->hdr_name_len) {
+    if (mp->hdr_name_len == 19 &&
+        strncasecmp(mp->hdr_name, "content-disposition", 19) == 0) {
+      if (mp->hdr_value_len >= MP_MAX_DISPOSITION) {
+        mp_set_error(mp, 400, "part header too large");
+      } else {
+        memcpy(mp->disposition, mp->hdr_value, mp->hdr_value_len);
+        mp->disposition_len = mp->hdr_value_len;
+        mp->saw_disposition = 1;
+      }
+    } else if (mp->hdr_name_len == 12 &&
+               strncasecmp(mp->hdr_name, "content-type", 12) == 0) {
+      if (mp->hdr_value_len >= MP_MAX_CTYPE) {
+        mp_set_error(mp, 400, "part content-type too long");
+      } else {
+        memcpy(mp->part_ctype, mp->hdr_value, mp->hdr_value_len);
+        mp->part_ctype_len = mp->hdr_value_len;
+      }
+    }
+  }
+  mp->hdr_name_len = 0;
+  mp->hdr_value_len = 0;
+  mp->in_header_value = 0;
+}
+
+static int mp_write_all(int fd, const char *p, size_t n)
+{
+  while (n > 0) {
+    ssize_t w = write(fd, p, n);
+    if (w > 0) {
+      p += w;
+      n -= (size_t)w;
+    } else if (w < 0 && errno == EINTR) {
+      continue;
+    } else {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+#define MP_FILE_FIELD 0
+#define MP_FILE_NAME  1
+#define MP_FILE_CTYPE 2
+
+static int mp_open_file(multipart_ctx_t *mp)
+{
+  mp->cur_file = -1;
+  if (mp->n_files >= MP_MAX_FILES || mp->n_files >= g_upload_max_files) {
+    mp->value_omitted = 1;   /* 文件数超限：省略，继续解析 */
+    return 0;
+  }
+  char path[600];
+  int pn = snprintf(path, sizeof(path), "%s/upload-XXXXXX", g_upload_dir);
+  if (pn < 0 || (size_t)pn >= sizeof(path)) {
+    mp_set_error(mp, 500, "upload dir path too long");
+    return -1;
+  }
+  int fd = mkstemp(path);
+  if (fd < 0) {
+    mp_set_error(mp, 507, "cannot create upload file: %s", strerror(errno));
+    return -1;
+  }
+
+  mp_file_t *f = &mp->files[mp->n_files];
+  memset(f, 0, sizeof(*f));
+  f->fd = fd;
+  f->path = strdup(path);
+  f->field = (char *)malloc(mp->part_name_len + 1);
+  f->filename = (char *)malloc(mp->part_filename_len + 1);
+  const char *ct = mp->part_ctype_len ? mp->part_ctype : "application/octet-stream";
+  f->ctype = strdup(ct);
+  if (!f->path || !f->field || !f->filename || !f->ctype) {
+    close(fd);
+    unlink(path);
+    free(f->path); free(f->field); free(f->filename); free(f->ctype);
+    memset(f, 0, sizeof(*f));
+    f->fd = -1;
+    mp_set_error(mp, 500, "out of memory for upload metadata");
+    return -1;
+  }
+  memcpy(f->field, mp->part_name, mp->part_name_len);
+  f->field[mp->part_name_len] = 0;
+  f->field_len = mp->part_name_len;
+  memcpy(f->filename, mp->part_filename, mp->part_filename_len);
+  f->filename[mp->part_filename_len] = 0;
+  f->filename_len = mp->part_filename_len;
+  f->ctype_len = strlen(f->ctype);
+  mp->n_files++;
+  mp->cur_file = (int)(mp->n_files - 1);
+  return 0;
+}
+
+static int mp_cb_part_begin(multipart_parser *p)
+{
+  multipart_ctx_t *mp = (multipart_ctx_t *)multipart_parser_get_data(p);
+  if (!mp) return 0;
+  mp->in_part = 1;
+  mp->in_header_value = 0;
+  mp->hdr_name_len = 0;
+  mp->hdr_value_len = 0;
+  mp->header_bytes = 0;
+  mp->disposition_len = 0;
+  mp->saw_disposition = 0;
+  mp->part_ctype_len = 0;
+  mp->part_name_len = 0;
+  mp->part_filename_len = 0;
+  mp->part_has_filename = 0;
+  mp->part_is_file = 0;
+  mp->cur_file = -1;
+  mp->value_omitted = 0;
+  mp->value_len = 0;
+  return 0;
+}
+
+static int mp_cb_header_field(multipart_parser *p, const char *at, size_t len)
+{
+  multipart_ctx_t *mp = (multipart_ctx_t *)multipart_parser_get_data(p);
+  if (!mp || mp->error_status) return 0;
+  if (mp->in_header_value) mp_header_pair(mp);
+  if (mp->error_status) return 0;
+  if (mp->hdr_name_len + len >= sizeof(mp->hdr_name)) {
+    mp_set_error(mp, 400, "part header name too long");
+    return 0;
+  }
+  memcpy(mp->hdr_name + mp->hdr_name_len, at, len);
+  mp->hdr_name_len += len;
+  mp->header_bytes += len;
+  if (mp->header_bytes > MP_PART_HEADER_MAX) {
+    mp_set_error(mp, 400, "part header too large");
+  }
+  return 0;
+}
+
+static int mp_cb_header_value(multipart_parser *p, const char *at, size_t len)
+{
+  multipart_ctx_t *mp = (multipart_ctx_t *)multipart_parser_get_data(p);
+  if (!mp || mp->error_status) return 0;
+  mp->in_header_value = 1;
+  if (mp->hdr_value_len + len >= sizeof(mp->hdr_value)) {
+    mp_set_error(mp, 400, "part header value too long");
+    return 0;
+  }
+  memcpy(mp->hdr_value + mp->hdr_value_len, at, len);
+  mp->hdr_value_len += len;
+  mp->header_bytes += len;
+  if (mp->header_bytes > MP_PART_HEADER_MAX) {
+    mp_set_error(mp, 400, "part header too large");
+  }
+  return 0;
+}
+
+static int mp_cb_headers_complete(multipart_parser *p)
+{
+  multipart_ctx_t *mp = (multipart_ctx_t *)multipart_parser_get_data(p);
+  if (!mp || mp->error_status) return 0;
+  mp_header_pair(mp);
+  if (mp->error_status) return 0;
+  if (!mp->saw_disposition) {
+    mp_set_error(mp, 400, "multipart part missing Content-Disposition");
+    return 0;
+  }
+  if (mp_parse_disposition(mp) != 0) {
+    mp_set_error(mp, 400, "invalid Content-Disposition");
+    return 0;
+  }
+  if (mp->part_name_len == 0) {
+    mp_set_error(mp, 400, "multipart part missing form field name");
+    return 0;
+  }
+  if (mp->part_has_filename) {
+    mp->part_is_file = 1;
+    mp_open_file(mp);
+  } else {
+    mp->part_is_file = 0;
+    mp->cur_file = -1;
+  }
+  return 0;
+}
+
+static int mp_cb_part_data(multipart_parser *p, const char *at, size_t len)
+{
+  multipart_ctx_t *mp = (multipart_ctx_t *)multipart_parser_get_data(p);
+  if (!mp || mp->error_status || !mp->in_part) return 0;
+
+  if (mp->part_is_file) {
+    if (mp->cur_file < 0) return 0;
+    mp_file_t *f = &mp->files[mp->cur_file];
+    if (f->omitted) return 0;
+    if (len > g_upload_max_file || f->size > g_upload_max_file - len) {
+      f->omitted = 1;
+      if (f->fd >= 0) { close(f->fd); f->fd = -1; }
+      if (f->path) { unlink(f->path); free(f->path); f->path = NULL; }
+      return 0;
+    }
+    if (mp_write_all(f->fd, at, len) != 0) {
+      mp_set_error(mp, 507, "write upload file failed: %s", strerror(errno));
+      f->omitted = 1;
+      if (f->fd >= 0) { close(f->fd); f->fd = -1; }
+      if (f->path) { unlink(f->path); free(f->path); f->path = NULL; }
+      return 0;
+    }
+    f->size += len;
+    return 0;
+  }
+
+  if (mp->value_omitted) return 0;
+  if (len > g_upload_max_field_bytes ||
+      mp->field_bytes > g_upload_max_field_bytes - len ||
+      mp->value_len > g_upload_max_field_bytes - len - mp->field_bytes) {
+    mp->value_omitted = 1;
+    return 0;
+  }
+  size_t need = mp->value_len + len;
+  if (need > mp->value_cap) {
+    size_t nc = mp->value_cap ? mp->value_cap : 256;
+    while (nc < need) nc *= 2;
+    char *nb = (char *)realloc(mp->value, nc);
+    if (!nb) {
+      mp_set_error(mp, 500, "out of memory for form field");
+      mp->value_omitted = 1;
+      return 0;
+    }
+    mp->value = nb;
+    mp->value_cap = nc;
+  }
+  memcpy(mp->value + mp->value_len, at, len);
+  mp->value_len += len;
+  return 0;
+}
+
+static int mp_cb_part_end(multipart_parser *p)
+{
+  multipart_ctx_t *mp = (multipart_ctx_t *)multipart_parser_get_data(p);
+  if (!mp || mp->error_status) return 0;
+
+  if (mp->part_is_file) {
+    if (mp->cur_file >= 0) {
+      mp_file_t *f = &mp->files[mp->cur_file];
+      if (f->fd >= 0) { close(f->fd); f->fd = -1; }
+      if (f->omitted) {
+        if (f->path) { unlink(f->path); free(f->path); f->path = NULL; }
+        free(f->field); free(f->filename); free(f->ctype);
+        memset(f, 0, sizeof(*f));
+        f->fd = -1;
+        if (mp->n_files > 0) mp->n_files--;
+      }
+    }
+  } else if (!mp->value_omitted && mp->part_name_len) {
+    int replaced = 0;
+    for (size_t i = 0; i < mp->n_fields; i++) {
+      mp_field_t *f = &mp->fields[i];
+      if (f->name_len == mp->part_name_len &&
+          memcmp(f->name, mp->part_name, mp->part_name_len) == 0) {
+        mp->field_bytes -= f->value_len;
+        free(f->value);
+        f->value = mp->value;
+        f->value_len = mp->value_len;
+        mp->value = NULL;
+        mp->value_len = 0;
+        mp->field_bytes += f->value_len;
+        replaced = 1;
+        break;
+      }
+    }
+    if (!replaced && mp->n_fields < MP_MAX_FIELDS) {
+      mp_field_t *f = &mp->fields[mp->n_fields];
+      f->name = (char *)malloc(mp->part_name_len + 1);
+      if (f->name) {
+        memcpy(f->name, mp->part_name, mp->part_name_len);
+        f->name[mp->part_name_len] = 0;
+        f->name_len = mp->part_name_len;
+        f->value = mp->value;
+        f->value_len = mp->value_len;
+        mp->value = NULL;
+        mp->value_len = 0;
+        mp->field_bytes += f->value_len;
+        mp->n_fields++;
+      }
+    }
+  }
+  free(mp->value);
+  mp->value = NULL;
+  mp->value_len = 0;
+  mp->value_cap = 0;
+  mp->in_part = 0;
+  mp->part_is_file = 0;
+  mp->cur_file = -1;
+  return 0;
+}
+
+static int mp_cb_body_end(multipart_parser *p)
+{
+  multipart_ctx_t *mp = (multipart_ctx_t *)multipart_parser_get_data(p);
+  if (mp) mp->body_end = 1;
+  return 0;
+}
+
+static int mp_init(conn_t *c, const char *boundary)
+{
+  request_t *r = &c->req;
+  multipart_ctx_t *mp = (multipart_ctx_t *)calloc(1, sizeof(*mp));
+  if (!mp) return -1;
+  mp->c = c;
+  mp->cur_file = -1;
+  snprintf(mp->boundary, sizeof(mp->boundary), "%s", boundary);
+
+  memset(&mp->settings, 0, sizeof(mp->settings));
+  mp->settings.on_part_data_begin = mp_cb_part_begin;
+  mp->settings.on_header_field = mp_cb_header_field;
+  mp->settings.on_header_value = mp_cb_header_value;
+  mp->settings.on_headers_complete = mp_cb_headers_complete;
+  mp->settings.on_part_data = mp_cb_part_data;
+  mp->settings.on_part_data_end = mp_cb_part_end;
+  mp->settings.on_body_end = mp_cb_body_end;
+
+  mp->parser = multipart_parser_init(mp->boundary, &mp->settings);
+  if (!mp->parser) { free(mp); return -1; }
+  multipart_parser_set_data(mp->parser, mp);
+  r->mp = mp;
+  return 0;
+}
+
+static int mp_feed(conn_t *c, const char *data, size_t len)
+{
+  request_t *r = &c->req;
+  multipart_ctx_t *mp = r->mp;
+  if (!mp) return -1;
+  if (mp->body_end) return 0;            /* 终止 boundary 之后是 epilogue，丢弃 */
+
+  if (len > 0 && mp->total > max_body_stream - len) {
+    mp_set_error(mp, 413, "body too large");
+    send_error(c, mp->error_status, mp->error_msg);
+    return -1;
+  }
+  size_t consumed = multipart_parser_execute(mp->parser, data, len);
+  mp->total += consumed;
+
+  if (mp->error_status) {
+    send_error(c, mp->error_status, mp->error_msg);
+    return -1;
+  }
+  if (!mp->body_end && consumed != len) {
+    mp_set_error(mp, 400, "malformed multipart body: %s",
+                 multipart_parser_get_error_message(mp->parser));
+    send_error(c, mp->error_status, mp->error_msg);
+    return -1;
+  }
+  return 0;
+}
+
+static void mp_complete(conn_t *c)
+{
+  request_t *r = &c->req;
+  multipart_ctx_t *mp = r->mp;
+  if (!mp || c->closing || mp->dispatched) return;
+  if (mp->error_status) {
+    send_error(c, mp->error_status, mp->error_msg);
+    return;
+  }
+  if (!mp->body_end) {
+    send_error(c, 400, "incomplete multipart body");
+    return;
+  }
+  mp->dispatched = 1;
+  start_handler(c);
+}
+
+static int mp_read_nil(lua_State *lua)
+{
+  lua_pushnil(lua);
+  return 1;
+}
+
+static void mp_publish_req(request_t *r)
+{
+  multipart_ctx_t *mp = r->mp;
+  lua_State *co = r->co;
+  if (!mp) return;
+
+  lua_pushboolean(co, 1);
+  lua_setfield(co, -2, "multipart");
+
+  lua_newtable(co);
+  for (size_t i = 0; i < mp->n_fields; i++) {
+    mp_field_t *f = &mp->fields[i];
+    lua_pushlstring(co, f->name, f->name_len);
+    lua_pushlstring(co, f->value ? f->value : "", f->value_len);
+    lua_settable(co, -3);
+  }
+  lua_setfield(co, -2, "fields");
+
+  lua_newtable(co);
+  for (size_t i = 0; i < mp->n_files; i++) {
+    mp_file_t *f = &mp->files[i];
+    if (f->omitted || !f->path) continue;
+    lua_newtable(co);
+    lua_pushlstring(co, f->field, f->field_len);
+    lua_setfield(co, -2, "field");
+    lua_pushlstring(co, f->filename, f->filename_len);
+    lua_setfield(co, -2, "filename");
+    lua_pushlstring(co, f->ctype, f->ctype_len);
+    lua_setfield(co, -2, "content_type");
+    lua_pushinteger(co, (lua_Integer)f->size);
+    lua_setfield(co, -2, "size");
+    lua_pushstring(co, f->path);
+    lua_setfield(co, -2, "path");
+    lua_rawseti(co, -2, (lua_Integer)(i + 1));
+  }
+  lua_setfield(co, -2, "files");
+
+  /* multipart 已由 C 层消费完，req:read()/text() 返回 nil */
+  lua_pushcfunction(co, mp_read_nil);
+  lua_setfield(co, -2, "read");
+  lua_pushcfunction(co, mp_read_nil);
+  lua_setfield(co, -2, "text");
+}
+
+static void upload_config_init(void)
+{
+  const char *d = getenv("HTTPD_UPLOAD_DIR");
+  if (d && *d) snprintf(g_upload_dir, sizeof(g_upload_dir), "%s", d);
+  const char *mf = getenv("HTTPD_UPLOAD_MAX_FILE");
+  if (mf && *mf) {
+    unsigned long long v = strtoull(mf, NULL, 10);
+    if (v > 0) g_upload_max_file = (size_t)v;
+  }
+  const char *mfb = getenv("HTTPD_UPLOAD_MAX_FIELD_BYTES");
+  if (mfb && *mfb) {
+    unsigned long long v = strtoull(mfb, NULL, 10);
+    if (v > 0) g_upload_max_field_bytes = (size_t)v;
+  }
+  const char *mfiles = getenv("HTTPD_UPLOAD_MAX_FILES");
+  if (mfiles && *mfiles) {
+    unsigned long long v = strtoull(mfiles, NULL, 10);
+    if (v > 0) g_upload_max_files = (size_t)v;
+  }
+  if (g_upload_max_files > MP_MAX_FILES) g_upload_max_files = MP_MAX_FILES;
+
+  if (mkdir(g_upload_dir, 0700) != 0 && errno != EEXIST) {
+    log_error(LOG_WARN, "multipart: cannot create upload dir %s: %s",
+              g_upload_dir, strerror(errno));
+  } else {
+    struct stat st;
+    if (stat(g_upload_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+      log_error(LOG_WARN, "multipart: upload dir %s is not a directory",
+                g_upload_dir);
+    }
+  }
+}
+
 /* ---------- 请求体 ---------- */
 
 static void deliver_body(conn_t *c)
@@ -4003,8 +4703,30 @@ static int try_parse_head(conn_t *c)
   }
   r->ka = ka;
 
+  /* multipart/form-data：C 层流式解析，解析完成后才启动 handler */
+  size_t ctlen = 0;
+  const char *ct = hdr_find(r->headers, num_headers, "content-type", &ctlen);
+  if (ct && ctlen >= 19 && strncasecmp(ct, "multipart/form-data", 19) == 0) {
+    char boundary[MP_BOUNDARY_MAX + 1];
+    if (mp_parse_boundary(ct, ctlen, boundary, sizeof(boundary)) != 0) {
+      send_error(c, 400, "invalid multipart boundary");
+      return 0;
+    }
+    if (mp_init(c, boundary) != 0) {
+      send_error(c, 500, "multipart parser init failed");
+      return 0;
+    }
+    r->multipart = 1;
+    snprintf(r->mp_boundary, sizeof(r->mp_boundary), "%s", boundary);
+    r->auto_buffer = 0;
+  }
+
   buf_consume(c, head_len);
 
+  if (r->multipart) {
+    c->state = ST_BODY;
+    return 1;
+  }
   if (r->auto_buffer && r->body_cl > 0) {
     c->state = ST_BODY; /* 等 body 收齐后启动协程 */
     return 1;
@@ -4059,6 +4781,15 @@ static int consume_chunked(conn_t *c)
       if (!r->discarding && r->chunk_total + n > max_body_stream) {
         send_error(c, 413, "body too large");
         return 0;
+      }
+      if (r->multipart) {
+        if (mp_feed(c, c->buf, n) != 0) return 0;
+        buf_consume(c, n);
+        r->body_received += n;
+        r->chunk_total += n;
+        r->chunk_remaining -= n;
+        if (r->chunk_remaining == 0) r->chunk_state = 2;
+        continue;
       }
       if (r->discarding) {
         r->body_received += n;
@@ -4123,6 +4854,10 @@ static int consume_chunked(conn_t *c)
       buf_consume(c, end);
       r->chunk_state = 4;
       r->body_eof = 1;
+      if (r->multipart) {
+        mp_complete(c);
+        return 1;
+      }
       if (r->waiting_read) {
         lua_pushnil(r->co);
         r->waiting_read = 0;
@@ -4147,6 +4882,22 @@ static int consume_body(conn_t *c)
   request_t *r = &c->req;
 
   if (r->chunked) return consume_chunked(c);
+
+  if (r->multipart) {
+    size_t want = r->body_cl - r->body_received;
+    size_t avail = c->len < want ? c->len : want;
+    if (avail > 0) {
+      if (mp_feed(c, c->buf, avail) != 0) return 0;
+      buf_consume(c, avail);
+      r->body_received += avail;
+    }
+    if (r->body_received >= r->body_cl) {
+      r->body_eof = 1;
+      mp_complete(c);
+      return 1;
+    }
+    return 0;
+  }
 
   size_t want = r->body_cl - r->body_received;
   size_t avail = c->len;
@@ -7235,6 +7986,7 @@ int main(int argc, char **argv)
 
   /* 多 worker 只从配置文件的 server.workers 读取；--check 与旧 app.lua 模式固定单 worker */
   g_worker_count = check_mode ? 1 : (size_t)detect_workers(cfg);
+  if (!check_mode) upload_config_init();
   if (g_worker_count > 1) {
     snprintf(g_config_path, sizeof(g_config_path), "%s", cfg);
     g_log_pipeline = 1;
