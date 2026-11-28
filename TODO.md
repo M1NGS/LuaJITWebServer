@@ -77,7 +77,8 @@ TLS 库选用 mbedTLS 3.6.8 LTS（源码构建、静态链接）。
 - TCP 选项：`nodelay` / `keepalive(idle/intvl/cnt)` / `user_timeout` / `backlog` / `reuse_port` /
   `send_buffer` / `recv_buffer`
 
-后续可选：`tls.ciphers`/`ciphersuites`、高并发握手线程池。
+后续可选：高并发握手线程池。（`tls.ciphers`/`ciphersuites` 已完成 2026-11-29：
+mbedTLS 名称 → IANA ID，非法名称启动失败，测试 `22_tls_ciphers_test.py`）
 
 ## 3. 路由与 uploader 配置（P1 已完成 2026-11-29）
 
@@ -213,7 +214,8 @@ P2：`kind="static"/"proxy"`、参数/正则路由、routes 热重载。
 ### 协议 / 功能
 
 - [ ] SNI IDN：RFC 3492 Punycode 编码/转换；多级通配需先定语义（当前仅 `*.suffix` 一级）。
-- [ ] `tls.ciphers` / `ciphersuites`：按 mbedTLS 3.6 API 映射 TLS 1.2/1.3 ID；非法名称启动报错。
+- [x] `tls.ciphers` / `ciphersuites`（2026-11-29）：mbedTLS 名称 → IANA ID（字符串/数组、
+  合并去重、非法名称启动失败），每代复制 ID 数组；测试 `22_tls_ciphers_test.py`。
 - [ ] HTTP/2：ALPN h2、帧解析、HPACK、流状态机、流控、与协程/背压/优雅退出集成；
   独立模块，不是现有 HTTP/1.1 状态机的补丁。
 

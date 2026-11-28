@@ -276,6 +276,7 @@ typedef struct tls_gen_s {
   mbedtls_pk_context default_key;  /* 每 worker 独立解析 */
   mbedtls_pk_context *sni_keys;    /* 与 mat->sni 一一对应；每 worker 独立 */
   tls_material_t *mat;             /* 持有一个引用（证书/CA 只读共享） */
+  int *cipher_ids;                 /* conf 不复制：每 gen 独立副本，0 结尾 */
   mbedtls_entropy_context entropy;
   mbedtls_ctr_drbg_context drbg;
   int refs;
@@ -293,6 +294,11 @@ static int g_tls_min13;
 static char g_tls_alpn_buf[8][64];
 static const char *g_tls_alpn[9];
 static int g_tls_alpn_count;
+
+/* tls.ciphers / tls.ciphersuites：mbedTLS 名称解析后的 IANA ID（0 结尾） */
+#define MAX_TLS_CIPHER_IDS 32
+static int g_tls_cipher_ids[MAX_TLS_CIPHER_IDS + 1];
+static int g_tls_cipher_count;
 
 static char g_sni_names[MAX_SNI_CERTS][128];
 static char g_sni_cert_paths[MAX_SNI_CERTS][512];
@@ -5413,6 +5419,84 @@ static void parse_buffers(lua_State *l, int sidx)
     die("buffers.write_high_water > write_hard_limit");
 }
 
+/* ---------- tls.ciphers / tls.ciphersuites ---------- */
+
+static void tls_cipher_add_id(int id)
+{
+  if (id == 0) return;
+  for (int i = 0; i < g_tls_cipher_count; i++) {
+    if (g_tls_cipher_ids[i] == id) return;
+  }
+  if (g_tls_cipher_count >= MAX_TLS_CIPHER_IDS)
+    die("tls.ciphers: too many ciphersuites (max %d)", MAX_TLS_CIPHER_IDS);
+  g_tls_cipher_ids[g_tls_cipher_count++] = id;
+}
+
+static void tls_cipher_add_name(const char *name)
+{
+  int id = mbedtls_ssl_get_ciphersuite_id(name);
+  if (id == 0) die("tls.ciphers: unknown ciphersuite '%s'", name);
+  tls_cipher_add_id(id);
+}
+
+/* 支持 "A:B" / "A,B" / 混合分隔，忽略空白 */
+static void tls_cipher_add_list(const char *s)
+{
+  const char *p = s;
+  while (*p) {
+    while (*p == ':' || *p == ',' || isspace((unsigned char)*p)) p++;
+    if (!*p) break;
+    const char *q = p;
+    while (*q && *q != ':' && *q != ',' && !isspace((unsigned char)*q)) q++;
+    size_t n = (size_t)(q - p);
+    if (n >= 128) die("tls.ciphers: ciphersuite name too long");
+    char name[128];
+    memcpy(name, p, n);
+    name[n] = 0;
+    tls_cipher_add_name(name);
+    p = q;
+  }
+}
+
+static void tls_parse_cipher_field(lua_State *l, int ti, const char *key)
+{
+  lua_getfield(l, ti, key);
+  if (lua_isnil(l, -1)) {
+    lua_pop(l, 1);
+    return;
+  }
+  if (lua_istable(l, -1)) {
+    size_t n = (size_t)lua_objlen(l, -1);
+    for (size_t i = 0; i < n; i++) {
+      lua_rawgeti(l, -1, (lua_Integer)(i + 1));
+      if (!lua_isstring(l, -1)) {
+        lua_pop(l, 2);
+        die("tls.%s must contain only strings", key);
+      }
+      tls_cipher_add_name(lua_tostring(l, -1));
+      lua_pop(l, 1);
+    }
+  } else if (lua_isstring(l, -1)) {
+    tls_cipher_add_list(lua_tostring(l, -1));
+  } else {
+    lua_pop(l, 1);
+    die("tls.%s must be a string or array", key);
+  }
+  lua_pop(l, 1);
+}
+
+static void tls_parse_ciphers(lua_State *l, int ti)
+{
+  g_tls_cipher_count = 0;
+  g_tls_cipher_ids[0] = 0;
+  tls_parse_cipher_field(l, ti, "ciphers");
+  tls_parse_cipher_field(l, ti, "ciphersuites");
+  g_tls_cipher_ids[g_tls_cipher_count] = 0;
+  if (g_tls_cipher_count > 0) {
+    log_error(LOG_INFO, "tls: %d configured ciphersuite(s)", g_tls_cipher_count);
+  }
+}
+
 static void parse_tls(lua_State *l, int sidx)
 {
   lua_getfield(l, sidx, "tls");
@@ -5524,9 +5608,7 @@ static void parse_tls(lua_State *l, int sidx)
   }
   lua_pop(l, 1);
 
-  if (cfg_str(l, ti, "ciphers") || cfg_str(l, ti, "ciphersuites")) {
-    log_error(LOG_WARN, "warning: tls.ciphers/ciphersuites not applied yet (using mbedTLS defaults)");
-  }
+  tls_parse_ciphers(l, ti);
   lua_pop(l, 1); /* tls */
 }
 
@@ -5941,6 +6023,7 @@ static void tls_gen_free(tls_gen_t *g)
   mbedtls_ctr_drbg_free(&g->drbg);
   mbedtls_entropy_free(&g->entropy);
   tls_material_unref(g->mat);
+  free(g->cipher_ids);
   free(g);
 }
 
@@ -6387,6 +6470,17 @@ static tls_gen_t *tls_gen_build(int fatal)
     tls_report(ret, err, sizeof(err));
     tls_msg(fatal, "ssl_config_defaults: %s", err);
     goto fail;
+  }
+  if (g_tls_cipher_count > 0) {
+    g->cipher_ids = (int *)malloc((size_t)(g_tls_cipher_count + 1) * sizeof(int));
+    if (!g->cipher_ids) {
+      tls_msg(fatal, "out of memory for TLS ciphersuites");
+      goto fail;
+    }
+    memcpy(g->cipher_ids, g_tls_cipher_ids,
+           (size_t)(g_tls_cipher_count + 1) * sizeof(int));
+    /* conf 不复制数组；g->cipher_ids 与代同寿命 */
+    mbedtls_ssl_conf_ciphersuites(&g->conf, g->cipher_ids);
   }
   mbedtls_ssl_conf_rng(&g->conf, mbedtls_ctr_drbg_random, &g->drbg);
   mbedtls_ssl_conf_verify(&g->conf, revocation_verify, NULL);

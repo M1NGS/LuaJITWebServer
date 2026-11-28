@@ -35,6 +35,10 @@
   `tests/LLM/19_tls_shared_material_test.py`（4 worker × 200 并发握手 + reload 代际）。
   reload 的 `reload_backup_t` 会额外持有一个 material 引用用于失败回滚，恢复时用
   `__atomic_exchange_n` + unref 旧全局引用。
+- `tls.ciphers`/`ciphersuites` 在 `parse_tls` 里解析为 IANA ID 全局数组；`tls_gen_build`
+  必须把 ID 数组复制到每代的 `g->cipher_ids`（`mbedtls_ssl_conf_ciphersuites` 不复制数组，
+  reload 改配置时旧连接/旧代不能看到新数组）。名称只接受 `mbedtls_ssl_get_ciphersuite_id`
+  可识别的 mbedTLS 形式。
 - `uv_queue_work` 的 work 回调运行在 libuv 线程池线程，**不能读提交线程的 `__thread` 变量**；
   所需配置/快照必须在提交前复制进 job（2026-11-28 吊销表与 TLS stamps 踩过这个坑）。
 - Lua 状态不可跨线程访问；`luaL_newstate`/`lua_close` 必须在所属 worker 线程。

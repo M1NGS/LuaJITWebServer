@@ -40,7 +40,9 @@ return {
       handshake_timeout = 10,            -- 秒；0 = 不超时
       check_interval = 10,               -- 定时检测证书 st_mtime（秒）；0 = 关闭
       -- alpn = { "http/1.1" },          -- 可选；本服务只支持 HTTP/1.1
-      -- ciphers / ciphersuites 暂未应用（使用 mbedTLS 默认）
+      -- ciphers / ciphersuites：mbedTLS 名称，字符串（":"/"," 分隔）或数组；省略 = 默认
+      -- ciphers = "TLS-ECDHE-RSA-WITH-AES-128-GCM-SHA256",
+      -- ciphersuites = { "TLS1-3-AES-128-GCM-SHA256", "TLS1-3-AES-256-GCM-SHA384" },
 
       -- SNI 多证书：精确匹配优先；通配仅支持 *.suffix（匹配一级标签）
       -- 客户端不带 SNI 或没有匹配项时使用上面的默认 cert/key 和全局 mTLS 策略

@@ -65,7 +65,7 @@ curl -i http://127.0.0.1:8080/
 
 HTTP/1.1 only；`routes` 支持精确/前缀 + method + `kind=lua|upload`（变化需 restart），
 无 static/proxy/参数路由；C 层 multipart 上传已实现（同步写盘，暂无 `filename*`/增量 SHA1/
-异步落盘）；SNI 不支持 IDN/多级通配；`tls.ciphers` 暂未应用。
+异步落盘）；SNI 不支持 IDN/多级通配；`tls.ciphers` 只接受 mbedTLS 名称。
 多 worker（`server.workers > 1`）：
 listen/workers 数量/日志通道开关变化需 restart；证书链/CA 进程级共享，私钥与
 `ssl_config`/DRBG 每 worker 独立（mbedTLS 以 threading 支持构建）。

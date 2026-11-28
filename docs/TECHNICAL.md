@@ -226,6 +226,10 @@ A/B 方式，避免阻塞事件循环。
 - TLS 1.2/1.3（`min_version` 可配）；ALPN 默认不限制，配置 `alpn={"http/1.1"}` 时只选 HTTP/1.1。
 - 关闭：尽力 `close_notify`，不等待对端。
 - 支持证书链、mTLS（全局 `ca`/`client_auth`），per-SNI 覆盖。
+- `tls.ciphers` / `ciphersuites`：`parse_tls` 用 `mbedtls_ssl_get_ciphersuite_id` 把
+  mbedTLS 名称（字符串或数组）解析为 IANA ID 列表（合并、去重、0 结尾；非法名称启动失败）；
+  `tls_gen_build` 为每代复制一份 ID 数组（`conf_ciphersuites` 不复制数组），再
+  `mbedtls_ssl_conf_ciphersuites`。mbedTLS API 允许 TLS1.2/1.3 混合列表。
 
 ### 9.1 SNI 与 per-SNI mTLS
 
@@ -551,6 +555,7 @@ LuaJIT 是共享库，运行时需要 `LD_LIBRARY_PATH=prefix/luajit/lib`。
 | `tests/LLM/19_tls_shared_material_test.py` | 4 worker 共享证书材料：200 并发 TLS1.2/1.3 握手、reload 后代际并发 |
 | `tests/LLM/20_multipart_upload_test.py` | C 层 multipart：字段/文件、quoted boundary、chunked、软限、400/413、清理、keep-alive、4 worker 并发 |
 | `tests/LLM/21_routes_test.py` | routes 精确/前缀/method/上传 415/fallback、多 worker、reload 拒绝变化、启动校验 |
+| `tests/LLM/22_tls_ciphers_test.py` | ciphers/ciphersuites：TLS1.2/1.3 限制、数组、默认对照、非法名称、4 worker、reload |
 | `tests/HUMAN/01_req_body_tristate_test.py` | body 三态语义（人工确认） |
 | `tests/HUMAN/02_shutdown_contract_test.py` | 优雅退出契约（人工确认） |
 | `bench/tests/pico_robust.py` | pico/luv 辅助服务器健壮性 |
@@ -589,10 +594,10 @@ WSL 抖动较大，历史数值仅作量级参考；当前版本未重新做完�
   C 层 multipart（同步写盘；无 `filename*`、增量 SHA1、异步落盘）
 - `routes` 只有精确/前缀 + method + `kind=lua|upload`，无正则/参数路由、static/proxy；
   routes 变化需 restart（SIGHUP 拒绝并保留旧路由）
-- SNI 不支持 IDN/多级通配；`tls.ciphers` 未应用
+- SNI 不支持 IDN/多级通配；`tls.ciphers` 只支持 mbedTLS 名称（无 OpenSSL 别名）
 - 吊销表 provider 仅 mock；libpq native 待接
 - 吊销只影响新握手；不断开已建立连接；会话恢复不重新校验证书
 - CPU-bound handler 阻塞 loop，也会延迟优雅退出
 
 后续方向（`TODO.md`）：路由扩展（static/proxy/参数路由）、multipart P2（`filename*`/SHA1/异步写盘）、
-libpq native、`tls.ciphers`、HTTP/2、高并发握手线程池。
+libpq native、SNI IDN、HTTP/2、高并发握手线程池。

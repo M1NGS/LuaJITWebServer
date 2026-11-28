@@ -149,9 +149,15 @@ tls = {
   handshake_timeout = 10,         -- 秒；0 = 不超时
   check_interval = 10,            -- 秒；定时检测证书文件 st_mtime；0 = 关闭
   alpn = { "http/1.1" },          -- 可选；只支持 HTTP/1.1
-  -- ciphers / ciphersuites 当前未应用（会告警，使用 mbedTLS 默认）
+  -- ciphers / ciphersuites：mbedTLS 名称，字符串（":"/"," 分隔）或数组；省略 = 默认
+  -- ciphers = "TLS-ECDHE-RSA-WITH-AES-128-GCM-SHA256:TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384"
+  -- ciphersuites = { "TLS1-3-AES-128-GCM-SHA256", "TLS1-3-AES-256-GCM-SHA384" }
 }
 ```
+
+`ciphers` 与 `ciphersuites` 最终合并成一个 IANA ID 列表交给 mbedTLS（API 允许 TLS1.2/1.3
+混合）；名称必须是 mbedTLS 的 `mbedtls_ssl_get_ciphersuite_id` 可识别形式，非法名称启动失败。
+示例：TLS1.2 `TLS-ECDHE-RSA-WITH-AES-128-GCM-SHA256`，TLS1.3 `TLS1-3-AES-128-GCM-SHA256`。
 
 注意：
 
@@ -834,7 +840,7 @@ BENCH_REPEAT=3 bash bench/run.sh c-httpd
 - `routes` 只支持精确/前缀 + method + `kind=lua|upload`；`kind=static/proxy`、正则/参数路由
   尚未实现。routes 变化需 restart（SIGHUP 会拒绝并保留旧路由）。`uploader` 只是透传业务配置。
 - SNI 不支持 IDN Unicode 自动转换和多级通配；配置写 Punycode/精确名。
-- `tls.ciphers` / `ciphersuites` 暂未应用。
+- `tls.ciphers` / `ciphersuites` 只接受 mbedTLS 名称（不支持 OpenSSL 别名）；数组中非法名称启动失败。
 - 吊销表 provider 目前只有 mock 文件；pgsql native 待接。
 - 吊销表只影响新握手；不断开已建立连接；会话恢复不重新校验证书。
 - 响应头格式、access/error 日志格式固定，不可配置。
