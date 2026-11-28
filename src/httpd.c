@@ -48,6 +48,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
@@ -284,6 +285,8 @@ typedef struct tls_gen_s {
 
 static __thread tls_gen_t *g_tls_gen;      /* 当前代（持 1 个引用）；每 worker 独立 */
 static int g_tls_enabled;
+
+static int domain_to_alabel(const char *in, size_t len, char *out, size_t cap);
 
 /* 配置文件里的证书路径等；定时检测按这些路径读取 */
 static char g_tls_cert_path[512];
@@ -5579,11 +5582,25 @@ static void parse_tls(lua_State *l, int sidx)
       if (!name || !cert || !key) {
         die("tls.sni[%d] requires server_name/cert/key", (int)i);
       }
-      if (strlen(name) >= sizeof(g_sni_names[0])) {
-        die("tls.sni[%d].server_name too long", (int)i);
+      /* server_name 归一化：Unicode → A-label；支持 *.suffix 与 **.suffix */
+      const char *wild = "";
+      const char *body = name;
+      if (name[0] == '*' && name[1] == '.') {
+        wild = "*.";
+        body = name + 2;
+      } else if (name[0] == '*' && name[1] == '*' && name[2] == '.') {
+        wild = "**.";
+        body = name + 3;
+      } else if (strchr(name, '*') != NULL) {
+        die("tls.sni[%d].server_name wildcard must be *.suffix or **.suffix",
+            (int)i);
       }
-      if (name[0] == '*' && !(name[1] == '.' && name[2] != 0)) {
-        die("tls.sni[%d].server_name wildcard must be *.suffix", (int)i);
+      char aname[128];
+      if (domain_to_alabel(body, strlen(body), aname, sizeof(aname)) != 0) {
+        die("tls.sni[%d].server_name is not a valid IDN/domain", (int)i);
+      }
+      if (strlen(wild) + strlen(aname) >= sizeof(g_sni_names[0])) {
+        die("tls.sni[%d].server_name too long after IDN conversion", (int)i);
       }
 
       int cauth = -1;
@@ -5595,7 +5612,7 @@ static void parse_tls(lua_State *l, int sidx)
         die("tls.sni[%d] client_auth requires ca (own or tls.ca)", (int)i);
       }
 
-      snprintf(g_sni_names[g_sni_count], sizeof(g_sni_names[0]), "%s", name);
+      snprintf(g_sni_names[g_sni_count], sizeof(g_sni_names[0]), "%s%s", wild, aname);
       snprintf(g_sni_cert_paths[g_sni_count], sizeof(g_sni_cert_paths[0]), "%s", cert);
       snprintf(g_sni_key_paths[g_sni_count], sizeof(g_sni_key_paths[0]), "%s", key);
       if (ca && ca[0]) {
@@ -6038,6 +6055,203 @@ static void tls_gen_unref(tls_gen_t *g)
 }
 
 /* 服务端 SNI：精确名优先，其次 *.suffix 通配（只匹配一级标签） */
+/* ---------- SNI 域名归一化：UTF-8 → A-label（RFC 3492 Punycode） ---------- */
+
+#define PUNY_BASE 36
+#define PUNY_TMIN 1
+#define PUNY_TMAX 26
+#define PUNY_SKEW 38
+#define PUNY_DAMP 700
+#define PUNY_INITIAL_BIAS 72
+#define PUNY_INITIAL_N 128
+
+static uint32_t puny_adapt(uint32_t delta, uint32_t numpoints, int firsttime)
+{
+  delta = firsttime ? delta / PUNY_DAMP : delta / 2;
+  delta += delta / numpoints;
+  uint32_t k = 0;
+  while (delta > ((PUNY_BASE - PUNY_TMIN) * PUNY_TMAX) / 2) {
+    delta /= PUNY_BASE - PUNY_TMIN;
+    k += PUNY_BASE;
+  }
+  return k + ((PUNY_BASE - PUNY_TMIN + 1) * delta) / (delta + PUNY_SKEW);
+}
+
+static char puny_digit(uint32_t d)
+{
+  return d < 26 ? (char)('a' + d) : (char)('0' + d - 26);
+}
+
+/* 单个 label 的 Punycode 编码（不含 xn-- 前缀）；cp 是 Unicode 码点 */
+static int puny_encode(const uint32_t *cp, size_t n, char *out, size_t cap)
+{
+  size_t o = 0;
+  size_t b = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (cp[i] < 0x80) {
+      if (o + 1 >= cap) return -1;
+      out[o++] = (char)tolower((unsigned char)cp[i]);
+      b++;
+    }
+  }
+  size_t h = b;
+  if (b > 0) {
+    if (o + 1 >= cap) return -1;
+    out[o++] = '-';
+  }
+  uint32_t nval = PUNY_INITIAL_N;
+  uint32_t delta = 0;
+  uint32_t bias = PUNY_INITIAL_BIAS;
+
+  while (h < n) {
+    uint32_t m = UINT32_MAX;
+    for (size_t i = 0; i < n; i++) {
+      if (cp[i] >= nval && cp[i] < m) m = cp[i];
+    }
+    if (m == UINT32_MAX) return -1;
+    uint64_t d = (uint64_t)(m - nval) * (h + 1);
+    if (d > (uint64_t)UINT32_MAX - delta) return -1;
+    delta += (uint32_t)d;
+    nval = m;
+
+    for (size_t i = 0; i < n; i++) {
+      if (cp[i] < nval) {
+        if (++delta == 0) return -1;
+      } else if (cp[i] == nval) {
+        uint32_t q = delta;
+        uint32_t k = PUNY_BASE;
+        for (;;) {
+          uint32_t t = k <= bias ? PUNY_TMIN
+                    : (k >= bias + PUNY_TMAX ? PUNY_TMAX : k - bias);
+          if (q < t) break;
+          uint32_t code = t + (q - t) % (PUNY_BASE - t);
+          if (o + 1 >= cap) return -1;
+          out[o++] = puny_digit(code);
+          q = (q - t) / (PUNY_BASE - t);
+          k += PUNY_BASE;
+        }
+        if (o + 1 >= cap) return -1;
+        out[o++] = puny_digit(q);
+        bias = puny_adapt(delta, (uint32_t)(h + 1), h == b);
+        delta = 0;
+        h++;
+      }
+    }
+    delta++;
+    nval++;
+  }
+  if (o >= cap) return -1;
+  out[o] = 0;
+  return 0;
+}
+
+/* UTF-8 解码；拒绝 overlong/surrogate/>U+10FFFF */
+static int utf8_decode(const char *s, size_t n, uint32_t *cp, size_t max, size_t *outn)
+{
+  size_t i = 0;
+  size_t o = 0;
+  while (i < n) {
+    unsigned char c = (unsigned char)s[i];
+    uint32_t v;
+    size_t need;
+    if (c < 0x80) {
+      v = c;
+      need = 0;
+    } else if ((c & 0xE0) == 0xC0) {
+      v = c & 0x1F;
+      need = 1;
+      if (v < 2) return -1;
+    } else if ((c & 0xF0) == 0xE0) {
+      v = c & 0x0F;
+      need = 2;
+    } else if ((c & 0xF8) == 0xF0) {
+      v = c & 0x07;
+      need = 3;
+    } else {
+      return -1;
+    }
+    if (i + need >= n && need > 0) return -1;
+    for (size_t j = 1; j <= need; j++) {
+      unsigned char cc = (unsigned char)s[i + j];
+      if ((cc & 0xC0) != 0x80) return -1;
+      v = (v << 6) | (cc & 0x3F);
+    }
+    if (need == 2 && v < 0x800) return -1;
+    if (need == 3 && v < 0x10000) return -1;
+    if (v >= 0xD800 && v <= 0xDFFF) return -1;
+    if (v > 0x10FFFF) return -1;
+    if (o >= max) return -1;
+    cp[o++] = v;
+    i += need + 1;
+  }
+  *outn = o;
+  return 0;
+}
+
+/* 把域名（可含 Unicode label）转为小写 A-label；通配前缀由调用方剥离 */
+static int domain_to_alabel(const char *in, size_t len, char *out, size_t cap)
+{
+  if (len == 0) return -1;
+  size_t o = 0;
+  size_t i = 0;
+  while (i < len) {
+    size_t j = i;
+    while (j < len && in[j] != '.') j++;
+    if (j == i) return -1;              /* 空 label（首尾点/连续点） */
+    const char *lab = in + i;
+    size_t ln = j - i;
+    int ascii = 1;
+    for (size_t k = 0; k < ln; k++) {
+      if ((unsigned char)lab[k] >= 0x80) { ascii = 0; break; }
+    }
+    if (ascii) {
+      if (ln > 63) return -1;
+      if (o + ln + 1 >= cap) return -1;
+      for (size_t k = 0; k < ln; k++)
+        out[o++] = (char)tolower((unsigned char)lab[k]);
+    } else {
+      if (ln > 255) return -1;
+      uint32_t cp[256];
+      size_t cn = 0;
+      if (utf8_decode(lab, ln, cp, 256, &cn) != 0) return -1;
+      char enc[128];
+      if (puny_encode(cp, cn, enc, sizeof(enc)) != 0) return -1;
+      size_t el = strlen(enc);
+      if (4 + el > 63) return -1;
+      if (o + 4 + el + 1 >= cap) return -1;
+      memcpy(out + o, "xn--", 4);
+      o += 4;
+      for (size_t k = 0; k < el; k++) out[o++] = enc[k];
+    }
+    if (j < len) {
+      if (o + 2 > cap) return -1;
+      out[o++] = '.';
+      i = j + 1;
+    } else {
+      break;
+    }
+  }
+  out[o] = 0;
+  return 0;
+}
+
+/* 客户端 SNI → 统一小写 A-label；非法 UTF-8/超长返回 -1（回退默认证书） */
+static int sni_normalize(const char *in, size_t len, char *out, size_t cap)
+{
+  int nonascii = 0;
+  for (size_t i = 0; i < len; i++) {
+    if ((unsigned char)in[i] >= 0x80) { nonascii = 1; break; }
+  }
+  if (!nonascii) {
+    if (len == 0 || len >= cap) return -1;
+    for (size_t i = 0; i < len; i++)
+      out[i] = (char)tolower((unsigned char)in[i]);
+    out[len] = 0;
+    return 0;
+  }
+  return domain_to_alabel(in, len, out, cap);
+}
+
 static int tls_apply_pair(mbedtls_ssl_context *ssl, tls_gen_t *g, size_t idx)
 {
   tls_material_sni_t *pair = &g->mat->sni[idx];
@@ -6057,16 +6271,16 @@ static int tls_sni_cb(void *p, mbedtls_ssl_context *ssl,
                       const unsigned char *name, size_t len)
 {
   tls_gen_t *g = (tls_gen_t *)p;
-  if (!g || !g->mat || len == 0 || len >= 128) return 0;
+  if (!g || !g->mat || len == 0) return 0;
   char host[128];
-  memcpy(host, name, len);
-  host[len] = 0;
+  if (sni_normalize((const char *)name, len, host, sizeof(host)) != 0) return 0;
 
   for (size_t i = 0; i < g->mat->sni_count; i++) {
     if (strcasecmp(host, g->mat->sni[i].server_name) == 0) {
       return tls_apply_pair(ssl, g, i);
     }
   }
+  /* 一级通配 *.suffix：只匹配一个标签 */
   for (size_t i = 0; i < g->mat->sni_count; i++) {
     const char *pat = g->mat->sni[i].server_name;
     if (strncmp(pat, "*.", 2) != 0) continue;
@@ -6074,8 +6288,17 @@ static int tls_sni_cb(void *p, mbedtls_ssl_context *ssl,
     size_t hl = strlen(host), sl = strlen(suffix);
     if (hl <= sl + 1 || host[hl - sl - 1] != '.') continue;
     if (strcasecmp(host + hl - sl, suffix) != 0) continue;
-    /* 通配只匹配一级标签：a.example.com 可以，a.b.example.com 不行 */
     if (memchr(host, '.', hl - sl - 1) != NULL) continue;
+    return tls_apply_pair(ssl, g, i);
+  }
+  /* 多级通配 **.suffix：至少一个标签，可多层；wild.example 不匹配 */
+  for (size_t i = 0; i < g->mat->sni_count; i++) {
+    const char *pat = g->mat->sni[i].server_name;
+    if (strncmp(pat, "**.", 3) != 0) continue;
+    const char *suffix = pat + 3;
+    size_t hl = strlen(host), sl = strlen(suffix);
+    if (hl <= sl + 1 || host[hl - sl - 1] != '.') continue;
+    if (strcasecmp(host + hl - sl, suffix) != 0) continue;
     return tls_apply_pair(ssl, g, i);
   }
   return 0; /* 使用默认证书 + 全局 mTLS 策略 */

@@ -39,6 +39,14 @@
   必须把 ID 数组复制到每代的 `g->cipher_ids`（`mbedtls_ssl_conf_ciphersuites` 不复制数组，
   reload 改配置时旧连接/旧代不能看到新数组）。名称只接受 `mbedtls_ssl_get_ciphersuite_id`
   可识别的 mbedTLS 形式。
+
+## SNI / IDN
+
+- 配置的 `tls.sni[].server_name` 启动时归一化为小写 A-label（`domain_to_alabel`，
+  RFC 3492 Punycode；Unicode label → `xn--...`），客户端 SNI 在 `tls_sni_cb` 里经
+  `sni_normalize` 同样归一化。只做编码，不做 NFC/case fold。
+- 通配匹配顺序：精确 → `*.suffix`（单层）→ `**.suffix`（任意层，至少一个标签）→ 默认证书。
+  改语义前更新 `tests/LLM/23_sni_idn_test.py` 和用户手册。
 - `uv_queue_work` 的 work 回调运行在 libuv 线程池线程，**不能读提交线程的 `__thread` 变量**；
   所需配置/快照必须在提交前复制进 job（2026-11-28 吊销表与 TLS stamps 踩过这个坑）。
 - Lua 状态不可跨线程访问；`luaL_newstate`/`lua_close` 必须在所属 worker 线程。

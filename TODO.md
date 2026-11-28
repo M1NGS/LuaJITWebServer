@@ -69,7 +69,7 @@ client_auth、handshake_timeout、ALPN、buffers/limits；旧 `luajit-httpd app.
 TLS 库选用 mbedTLS 3.6.8 LTS（源码构建、静态链接）。
 
 已实现：
-- SNI 多证书（精确名 + 一级 `*.suffix` 通配，未匹配回退默认证书）
+- SNI 多证书（精确名 + `*.suffix` 一级 + `**.suffix` 多级；IDN 转 A-label；未匹配回退默认证书）
 - per-SNI mTLS：每项可设置自己的客户端 `ca` 和 `client_auth`，省略则继承全局
 - 证书定时检测：每 `tls.check_interval` 秒由线程池 stat 默认/SNI 证书、私钥、CA 的 `st_mtim`，
   有变化才在后台构建新证书代；主线程切换 `g_tls_gen` 指针（A/B），旧连接持旧代，引用计数释放
@@ -213,7 +213,8 @@ P2：`kind="static"/"proxy"`、参数/正则路由、routes 热重载。
 
 ### 协议 / 功能
 
-- [ ] SNI IDN：RFC 3492 Punycode 编码/转换；多级通配需先定语义（当前仅 `*.suffix` 一级）。
+- [x] SNI IDN（2026-11-29）：RFC 3492 Punycode 编码（配置与客户端名称归一化到 A-label）；
+  `*.suffix` 一级 + `**.suffix` 任意级（非标准扩展）；测试 `23_sni_idn_test.py`。
 - [x] `tls.ciphers` / `ciphersuites`（2026-11-29）：mbedTLS 名称 → IANA ID（字符串/数组、
   合并去重、非法名称启动失败），每代复制 ID 数组；测试 `22_tls_ciphers_test.py`。
 - [ ] HTTP/2：ALPN h2、帧解析、HPACK、流状态机、流控、与协程/背压/优雅退出集成；

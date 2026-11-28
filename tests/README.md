@@ -3,7 +3,7 @@
 本目录是 `luajit-httpd` 的功能回归测试套件。每个测试脚本都是**独立可运行**的：自动选择空闲端口、
 创建临时目录/配置/证书、启动自己的服务器进程、执行用例、停止进程并清理，不依赖预先启动的服务。
 
-当前共 24 个套件（22 个 LLM + 2 个 HUMAN），`python3 -I tests/run_all.py` 全部通过。
+当前共 25 个套件（23 个 LLM + 2 个 HUMAN），`python3 -I tests/run_all.py` 全部通过。
 
 ## 目录
 
@@ -84,6 +84,7 @@ python3 -I tests/HUMAN/02_shutdown_contract_test.py
 | `LLM/20_multipart_upload_test.py` | C 层 multipart：字段/文件元数据与内容、quoted boundary、chunked、同名覆盖、文件/字段/文件数软限、缺 boundary/坏 part 400、超 max_body 413、handler 403 与客户端中断清理、keep-alive、4 worker 16 并发上传 |
 | `LLM/21_routes_test.py` | routes：精确/前缀/method 匹配、kind=upload 415、未命中 fallback、单 worker reload 限制、多 worker 路由与 app 重载、routes 变化拒绝、启动结构校验 |
 | `LLM/22_tls_ciphers_test.py` | TLS1.2/1.3 ciphersuite 限制、字符串/数组、默认对照、非法名称启动失败、4 worker、SIGHUP 更新 |
+| `LLM/23_sni_idn_test.py` | SNI 配置 Unicode→A-label（RFC 3492）、大小写、`*.`/`**.` 通配、非法域名启动失败、4 worker |
 | `HUMAN/01_req_body_tristate_test.py` | 用户质疑的 `req.body == nil` 歧义：无 body / 小 body / 大 body 的 `has_body/body_size/streaming/buffered` 与 GET `/echo` 400 |
 | `HUMAN/02_shutdown_contract_test.py` | 用户确认的退出契约：首次 SIGINT 关闭监听/空闲连接、新连接拒绝；在飞请求受 `shutdown_timeout` 约束 |
 
@@ -96,6 +97,7 @@ python3 -I tests/HUMAN/02_shutdown_contract_test.py
 | multipart/form-data 上传（C 层） | 20 |
 | routes 路由表 | 21 |
 | tls.ciphers/ciphersuites | 22 |
+| SNI IDN / 多级通配 | 23 |
 | 响应 CL/chunked/close、HEAD | 01, 02, 06 |
 | keep-alive / pipeline | 01, 02, 08 |
 | TLS 握手/ALPN | 02 |
@@ -131,7 +133,7 @@ python3 -I tests/HUMAN/02_shutdown_contract_test.py
 
 - HTTP/2、routes 的 static/proxy/参数路由（尚未实现）；`uploader` 只是透传业务配置
 - multipart P2：RFC 5987 `filename*`、增量 SHA1、异步落盘、磁盘写满/ENOSPC 故障注入（当前用 `/proc` 等不可写目录覆盖 507 之外的路径）
-- SNI IDN 自动转换、多级通配；`tls.ciphers` 只支持 mbedTLS 名称（无 OpenSSL 别名）
+- SNI 不做 Unicode NFC/case fold，只做 Punycode 编码；`tls.ciphers` 只支持 mbedTLS 名称（无 OpenSSL 别名）
 - 吊销后主动断开已建立连接、TLS 会话恢复重新校验
 - CPU-bound handler 期间的优雅退出（单线程 loop 无法中断）
 - 真实 libpq provider（当前只有 mock 文件）

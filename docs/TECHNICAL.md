@@ -239,8 +239,12 @@ A/B 方式，避免阻塞事件循环。
   - 可选 `mbedtls_ssl_set_hs_ca_chain`（自己的客户端 CA）
   - `mbedtls_ssl_set_hs_authmode`（该域名是否要求客户端证书）
 - 省略 `ca` 继承全局 `tls.ca`；省略 `client_auth` 继承全局。per-SNI CA 的文件在启动/刷新时加载。
-- 不支持 IDN Unicode 自动转 Punycode；配置写 A-label 即可。不支持多级通配（`*.example.com`
-  不匹配 `a.b.example.com`）。
+- 名称归一化：配置的 `server_name` 与客户端 SNI 都按 RFC 3492 转为小写 A-label
+  （UTF-8 解码校验 overlong/surrogate/>U+10FFFF；每 label ≤63 字节、总长 ≤127）。
+  只做 Punycode 编码，不做 Unicode NFC/case fold。
+- 匹配顺序：精确 → `*.suffix`（单层，`a.example.com` 命中、`a.b.example.com` 不命中）→
+  `**.suffix`（任意层，至少一个标签；`example.com` 不命中）→ 默认证书 + 全局策略。
+  `**.` 是非标准扩展，按配置顺序参与匹配。
 
 ### 9.2 定时证书检测与 A/B
 
@@ -556,6 +560,7 @@ LuaJIT 是共享库，运行时需要 `LD_LIBRARY_PATH=prefix/luajit/lib`。
 | `tests/LLM/20_multipart_upload_test.py` | C 层 multipart：字段/文件、quoted boundary、chunked、软限、400/413、清理、keep-alive、4 worker 并发 |
 | `tests/LLM/21_routes_test.py` | routes 精确/前缀/method/上传 415/fallback、多 worker、reload 拒绝变化、启动校验 |
 | `tests/LLM/22_tls_ciphers_test.py` | ciphers/ciphersuites：TLS1.2/1.3 限制、数组、默认对照、非法名称、4 worker、reload |
+| `tests/LLM/23_sni_idn_test.py` | SNI Unicode→A-label、大小写、`*.`/`**.` 通配、非法域名、4 worker |
 | `tests/HUMAN/01_req_body_tristate_test.py` | body 三态语义（人工确认） |
 | `tests/HUMAN/02_shutdown_contract_test.py` | 优雅退出契约（人工确认） |
 | `bench/tests/pico_robust.py` | pico/luv 辅助服务器健壮性 |
@@ -594,10 +599,10 @@ WSL 抖动较大，历史数值仅作量级参考；当前版本未重新做完�
   C 层 multipart（同步写盘；无 `filename*`、增量 SHA1、异步落盘）
 - `routes` 只有精确/前缀 + method + `kind=lua|upload`，无正则/参数路由、static/proxy；
   routes 变化需 restart（SIGHUP 拒绝并保留旧路由）
-- SNI 不支持 IDN/多级通配；`tls.ciphers` 只支持 mbedTLS 名称（无 OpenSSL 别名）
+- SNI 不做 Unicode NFC/case fold；`tls.ciphers` 只支持 mbedTLS 名称（无 OpenSSL 别名）
 - 吊销表 provider 仅 mock；libpq native 待接
 - 吊销只影响新握手；不断开已建立连接；会话恢复不重新校验证书
 - CPU-bound handler 阻塞 loop，也会延迟优雅退出
 
 后续方向（`TODO.md`）：路由扩展（static/proxy/参数路由）、multipart P2（`filename*`/SHA1/异步写盘）、
-libpq native、SNI IDN、HTTP/2、高并发握手线程池。
+libpq native、HTTP/2、高并发握手线程池。

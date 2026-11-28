@@ -165,7 +165,7 @@ tls = {
 - `cert`/`key` 必须可读；证书/私钥不匹配、CA 加载失败会在启动时报错退出。
 - 证书更新：直接替换文件内容，等待 `check_interval`，服务自动加载；**不需要发信号**。
   新连接使用新证书，已建立连接继续用旧证书；坏文件会保留旧证书并在下个周期重试。
-- 只支持单证书/SNI 多证书；没有 SNI 多级通配和 IDN 自动转换。
+- 支持单证书/SNI 多证书、`*.suffix` 一级通配与 `**.suffix` 多级通配；SNI 名称可用 Unicode（启动时转 A-label）。
 
 ### 4.4 SNI 多证书与 per-SNI mTLS
 
@@ -183,16 +183,22 @@ tls = {
     { server_name = "inherit.example.com", cert = "inherit.crt",
       key = "inherit.key", client_auth = true },  -- 省略 ca：继承 tls.ca
     { server_name = "*.wild.example.com", cert = "wild.crt", key = "wild.key" },
+    { server_name = "**.deep.example.com", cert = "deep.crt", key = "deep.key" },
+    { server_name = "例子.example", cert = "idn.crt", key = "idn.key" },
   },
 }
 ```
 
 匹配规则：
 
-- 精确名优先；`*.suffix` 只匹配一级标签（`a.example.com` 可以，`a.b.example.com` 不行）。
+- 精确名优先；`*.suffix` 只匹配一级标签（`a.example.com` 可以，`a.b.example.com` 不行）；
+  `**.suffix` 匹配任意深度（至少一个标签；`a.example.com`、`a.b.example.com` 都行，
+  `example.com` 不行）。多级通配是非标准扩展，按需使用。
 - 无 SNI 或无匹配 → 默认证书 + 全局 `client_auth`/`ca`。
 - 每个 SNI 可单独设置客户端 CA 和是否要求客户端证书；省略则继承全局。
-- SNI 名称按 ASCII 匹配，大小写不敏感；IDN 请写 Punycode（`xn--...`）。
+- 匹配大小写不敏感。`server_name` 可以直接写 Unicode 域名：启动时按 RFC 3492 转成
+  A-label（`例子.example` → `xn--fsqu00a.example`）；客户端发来 Unicode SNI 时服务端
+  也做同样归一化。只做 Punycode 编码，不做 Unicode NFC/case fold 规范化。
 
 ### 4.5 server.buffers
 
@@ -839,7 +845,7 @@ BENCH_REPEAT=3 bash bench/run.sh c-httpd
 - `multipart/form-data` 由 C 层流式解析（见 5.1.1）：同步写盘；暂无 `filename*`、增量 SHA1、异步落盘。
 - `routes` 只支持精确/前缀 + method + `kind=lua|upload`；`kind=static/proxy`、正则/参数路由
   尚未实现。routes 变化需 restart（SIGHUP 会拒绝并保留旧路由）。`uploader` 只是透传业务配置。
-- SNI 不支持 IDN Unicode 自动转换和多级通配；配置写 Punycode/精确名。
+- SNI 支持 Unicode→A-label（RFC 3492）与 `**.suffix` 多级通配；不做 Unicode NFC/case fold，Greek/带符号的域名请写规范形式。
 - `tls.ciphers` / `ciphersuites` 只接受 mbedTLS 名称（不支持 OpenSSL 别名）；数组中非法名称启动失败。
 - 吊销表 provider 目前只有 mock 文件；pgsql native 待接。
 - 吊销表只影响新握手；不断开已建立连接；会话恢复不重新校验证书。

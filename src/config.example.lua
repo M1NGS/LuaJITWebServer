@@ -44,7 +44,8 @@ return {
       -- ciphers = "TLS-ECDHE-RSA-WITH-AES-128-GCM-SHA256",
       -- ciphersuites = { "TLS1-3-AES-128-GCM-SHA256", "TLS1-3-AES-256-GCM-SHA384" },
 
-      -- SNI 多证书：精确匹配优先；通配仅支持 *.suffix（匹配一级标签）
+      -- SNI 多证书：精确优先；*.suffix 匹配一级，**.suffix 匹配任意层（非标准扩展）
+      -- server_name 可直接写 Unicode（启动时转 A-label）
       -- 客户端不带 SNI 或没有匹配项时使用上面的默认 cert/key 和全局 mTLS 策略
       -- 每个 SNI 可单独设置 ca / client_auth；省略则继承全局 tls.ca / client_auth
       -- sni = {
