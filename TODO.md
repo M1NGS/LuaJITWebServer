@@ -151,7 +151,11 @@ handler 仍由 Lua 执行；`kind="upload"` 与 C 层 multipart 上传联动。
   按 targets 位图分发；file writer 单写者写盘/rotate；OTLP/syslog 发送线程从 collector 入队；
   关闭顺序 worker→collector→file→发送线程；多 worker 三通道和内置 rotate 已启用。
   吊销表改为进程级共享（原子指针 + 引用计数 + retire 队列），只加载/刷新一次。
-- P1 待做：TLS 材料共享（证书/私钥/CA 解析一次 + per-worker conf/DRBG + 原子发布）、
+- P1 待做：TLS 材料共享。2026-11-29 实测：把 `mbedtls_ssl_config`/证书/私钥做进程级共享、
+  每 worker 只用线程局部 DRBG，4 worker 200 并发握手出现 `BAD_SIGNATURE`（仅 31 成功），
+  已回退到 per-worker 证书代。mbedTLS 的 conf/pk 不能跨线程共享；若继续只能共享只读
+  `mbedtls_x509_crt`/CA、pk/conf 每 worker 独立，且必须做并发握手验证。
+- P1 待做：
   每 worker 统计与连接配额、连接分布监控。
 - P2：`SO_ATTACH_REUSEPORT_EBPF` 按 CPU 分流（已评估，复杂度/不确定性高，暂不做）、
   绑核、jemalloc 调参、`lua_shared_dict`（业务跨 worker KV，尚未设计）。
