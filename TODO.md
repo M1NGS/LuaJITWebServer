@@ -80,7 +80,10 @@ TLS 库选用 mbedTLS 3.6.8 LTS（源码构建、静态链接）。
 后续可选：高并发握手线程池。（`tls.ciphers`/`ciphersuites` 已完成 2026-11-29：
 mbedTLS 名称 → IANA ID，非法名称启动失败，测试 `22_tls_ciphers_test.py`）
 
-## 3. 路由与 uploader 配置（P1 已完成 2026-11-29）
+## 3. 路由与 uploader 配置（P1 已完成；将被第 13 节新架构替换）
+
+> 2026-11-29 讨论确定：当前 `routes` 扁平分发表 + config 内联 handler 的方案不满足
+> domain/app/validator/component 模型，将由第 13 节替换。当前实现先保留，直到新架构落地。
 
 `routes`（path/method/kind/handler）与 `uploader.uri` 等业务配置；C 编译路由表，
 handler 仍由 Lua 执行；`kind="upload"` 与 C 层 multipart 上传联动。
@@ -207,7 +210,7 @@ P2：`kind="static"/"proxy"`、参数/正则路由、routes 热重载。
   （见第 10 节；整代共享已因 `BAD_SIGNATURE` 否决）。
 - [x] `routes` 配置（2026-11-29，第 3 节）：path/method/prefix/kind/handler 内联函数，
   未命中 app.handle，upload 路由强制 multipart；测试 `21_routes_test.py`。
-  剩 P2：static/proxy、参数路由、routes 热重载。
+  **将被第 13 节 domain/app/validator/component 新架构替换**。
 - [x] C 层流式 multipart 上传（2026-11-29，第 1 节）：`tests/LLM/20_multipart_upload_test.py`；
   P2 剩 `filename*`/增量 SHA1/异步写盘。
 
@@ -217,8 +220,7 @@ P2：`kind="static"/"proxy"`、参数/正则路由、routes 热重载。
   `*.suffix` 一级 + `**.suffix` 任意级（非标准扩展）；测试 `23_sni_idn_test.py`。
 - [x] `tls.ciphers` / `ciphersuites`（2026-11-29）：mbedTLS 名称 → IANA ID（字符串/数组、
   合并去重、非法名称启动失败），每代复制 ID 数组；测试 `22_tls_ciphers_test.py`。
-- [ ] HTTP/2：ALPN h2、帧解析、HPACK、流状态机、流控、与协程/背压/优雅退出集成；
-  独立模块，不是现有 HTTP/1.1 状态机的补丁。
+- [ ] HTTP/2：见第 12 节（方案已定 nghttp2，**暂缓实现**；先完成 routes/Lua 对应关系讨论）。
 
 ### 多 worker / 日志收尾
 
@@ -239,3 +241,121 @@ P2：`kind="static"/"proxy"`、参数/正则路由、routes 热重载。
 - [x] chunked 请求体：`tests/LLM/17_chunked_request_test.py`。
 - [x] workers>1 SIGHUP reload：`tests/LLM/18_multiworker_reload_test.py`。
 - [x] 日志三通道/rotate、吊销表共享、多 worker 基础架构。
+
+## 12. HTTP/2 方案（暂缓，2026-11-28 讨论结论）
+
+- 选型：**nghttp2**（`libnghttp2`，MIT，源码构建，pin 1.71.x）。只取协议引擎，不引入其
+  I/O/线程模型；CMake `-DENABLE_LIB_ONLY=ON`、静态库、关闭 apps/tests/OpenSSL/libev
+  （`h2load` 客户端另建时再拉 libev/OpenSSL）。
+- 接入：TLS 握手后按 ALPN 选 `h2`（`alpn = {"h2","http/1.1"}`，`mbedtls_ssl_get_alpn_protocol`）；
+  每连接一个 `nghttp2_session`，每 worker 独立。解密字节 → `nghttp2_session_mem_recv`；
+  send callback → 现有 `tls_out`/`uv_write`；`on_header`/`on_data_chunk_recv` 映射到每流
+  `request_t` + Lua 协程；响应 `send_head`→HEADERS、`send_body`→DATA、`send_finish`→END_STREAM；
+  `res:drain` 映射到 `nghttp2_session_get_stream_remote_window_size`。
+- 范围：只做 TLS h2；不做 h2c/Upgrade、服务器推送（RFC 9113 已废弃）、完整优先级树、HTTP/3。
+- 防护：`SETTINGS_MAX_CONCURRENT_STREAMS`（先 8–16）、HPACK 解压后头大小上限、
+  `max_body`、RST_STREAM/流创建速率限制、每连接内存上限、GOAWAY 优雅退出。
+- 构建/测试：`bench/build.sh` 新增 nghttp2（lib-only）；curl 重建 `--with-nghttp2`；
+  新增 `tests/LLM/24_http2_test.py`（ALPN 选择、GET/POST、HEADERS/DATA、流控、GOAWAY、
+  非法帧）；`h2load` 可选（需 libev/OpenSSL 源码构建）。
+- 分期：P0（ALPN/GET/HEAD/POST/响应/基本流控/少量并发流/GOAWAY）约 800–1200 行；
+  P1（多流并发/每流协程/完整背压/RST/超时/Rapid Reset 防护/优雅退出）再 1000+ 行。
+- 状态：**暂缓**；先讨论并调整 routes 与 Lua 的对应关系，再评估是否启动。
+
+## 13. 新配置架构：domain / app / validator / component / route tree（讨论中，2026-11-29）
+
+### 13.1 背景
+
+当前 `routes`（第 3 节）是扁平分发表 + config.lua 内联函数，无法表达：
+C 组件接管请求（如流式上传）、连接级/请求级验证器、domain 与 app 的归属关系。
+决定重构为下面模型；新架构落地后删除旧 routes 实现和 multipart 自动解析入口。
+
+### 13.2 概念
+
+- **domain**：TLS/端口单位，`domains.new({...})`。
+  - `name` 支持通配符；域名匹配逻辑与路由树一致（最长/最具体优先，
+    `*.example.com` 不能覆盖已定义的 `a.example.com`）。
+  - `http = { port, timeout, keepalive, ... }`、`https = { port, cert, key }`
+    （各一个端口；与别的 domain 同端口时由 Host/SNI 区分）。
+  - domain 自身不写 app；由 app 关联 domain 实例。
+- **app**：业务单位，`app.new({ script = "...", validator = {...}, domains = {...} })`。
+  - app 显式指定 validator（列表）；一个 domain 实例只能被一个 app 关联，
+    启动时校验重复关联。
+  - `script` 加载后提供 `handle`；组件通过 `hooks` 回调 Lua（`on_upload_file` 等）。
+- **validator**：`validator.newHttpsClient({cert, crl})`、`newJwt`、`newToken`、`newCustom`。
+  - 分连接级（httpsClient，TLS 握手期）与请求级（jwt/token，组件链）。
+  - app.validator 含 httpsClient → 关联 domain 的 TLS 自动 `client_auth=true`，
+    CA/CRL 来自该 validator；同一 domain 只能一套客户端证书策略。
+- **component**：C 组件对象，如 `component.newMultipart({dir, max_file, ...})`。
+  挂在 route 的 `components` 上，按阶段（auth → body → after）接管请求；
+  失败短路响应、不调 Lua；完成后（P0）或流中（P1 hooks）回调 app。
+- **route tree**：domain 内的路径前缀树，最长匹配优先：
+  `/api/v1/patch` 不会被 `/api/v1` 覆盖。节点含 path、components、app（是否允许
+  route 覆盖 app 待定，见 13.6）。
+
+### 13.3 配置形态（Lua 类 + 方法）
+
+```lua
+admin    = validator.newHttpsClient({ cert = "/etc/ssl/client-ca.crt", crl = {...} })
+jwt      = validator.newJwt({ secret = "...", header = "Authorization" })
+uploader = component.newMultipart({ dir = "/var/lib/httpd/upload", max_file = ... })
+
+local vh_a = domains.new({
+  name  = "a.example.com",
+  http  = { port = 8080, timeout = 30, keepalive = 60 },
+  https = { port = 8443, cert = "a.crt", key = "a.key" },
+})
+local vh_c = domains.new({
+  name  = "c.example.com",
+  http  = { port = 8080 },
+  https = { port = 8443, cert = "c.crt", key = "c.key" },
+})
+
+order = app.new({
+  script    = "../../order.lua",
+  validator = { admin, jwt },
+  domains   = { vh_a, vh_c },   -- domain 唯一归属此 app
+})
+```
+
+注意：Lua 变量名不能带点（`local vh_xxx.com` 不合法，示例用 `vh_a`/`vh_c`）；
+domain 的 `https.cert/key` 在 `https` 子表内，不再放 domain 顶层。
+
+### 13.4 ciphers / TLS 策略
+
+- **决定：`ciphers` 保持全局**（`server.tls.ciphers` / `ciphersuites`），不做 domain 级
+  （mbedTLS 的 ciphersuite 列表是连接级 conf，ClientHello 前确定，无法按 SNI 切换）。
+- 原生已有：mbedTLS 名称解析、非法名称启动失败、每代复制 ID 数组；
+  测试 `22_tls_ciphers_test.py`。
+- app.validator 的 httpsClient 控制 domain 的 `client_auth/CA/CRL`；ciphers 仍全局。
+
+### 13.5 端口/listener 规则
+
+- domain 的 `http`/`https` 各一个端口；C 按 `(bind地址, 端口, 协议)` 合并 listener；
+  同端口多个 domain 用 Host（HTTP）/ SNI（HTTPS）区分。
+- 同一 `(host, port)` 不能同时 HTTP 和 HTTPS；workers>1 时端口 0 拒绝（现有规则）。
+- P0：TLS 用全局 SNI 表（所有 listener 共享证书集）；P1：per-listener SNI 隔离
+  （每端口只提供本端口 domain 的证书），与 per-listener `tls_gen/conf` 改造一起做。
+- HTTP 请求 Host 必须属于该 listener 的 domain 集合；Host/SNI 不一致返回
+  421/400（待定见 13.6）；无 SNI/无 Host 用默认 domain（待定）。
+
+### 13.6 待定（下一轮先确认）
+
+- route 是否允许覆盖 domain 的 app（与“一个 domain 唯一 app”冲突）；
+- method 不匹配：405 + Allow 还是回退 app.handle；
+- Host/SNI 不一致：421 还是 400；默认 domain 怎么声明；
+- upload 的 Lua 回调：P0 仅完成后交付，还是必须支持流中 `on_file/on_part`；
+- 多 validator 的 CRL：P0 复用全局 revocation，P1 按 validator 共享/引用计数；
+- domain 通配符语法：沿用 SNI 的 `*.suffix`/`**.suffix`，匹配最具体优先。
+
+### 13.7 迁移与工作量
+
+- 现有 `tls.sni` → domain（证书/CA/client_auth 由 validator 推导）；现有 SNI 能力
+  （多证书、per-SNI mTLS、IDN、通配、材料共享）保留。
+- multipart 现有 C 内核改为 `component.newMultipart`；不再自动解析，只有挂组件的
+  route 才接管 body。
+- 旧 routes 21 测试、multipart 20 测试需要适配/重写；新增新架构测试套件。
+- P0 估算 2000–2500 行（DSL 构造器、domain→listener、路由树、组件链、validator 框架、
+  app 加载、迁移 multipart）+ 测试；分阶段落地。
+- 构建：`validator`/`component`/`app`/`domains` 构造器由 C 注入配置 VM；对象为带
+  `__type` 的 table，C 解析；每 worker 重新构造（配置只读语义）。
