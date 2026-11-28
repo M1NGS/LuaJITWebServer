@@ -78,8 +78,9 @@ LD_LIBRARY_PATH=prefix/luajit/lib \
 
 `server.workers` 控制 worker 线程数：默认 `1`；`N`（上限 256）为线程数；`"auto"` 取
 `sysconf(_SC_NPROCESSORS_ONLN)`。workers>1 时每个 worker 有自己的 loop、LuaJIT VM、listener
-（`SO_REUSEPORT` 强制开启）、日志 sink、TLS 证书代和吊销表；业务模块的 Lua 全局状态/缓存
-**按 worker 隔离**，不跨 worker 共享。当前 P0 限制：
+（`SO_REUSEPORT` 强制开启）、日志 sink、TLS 配置代（私钥/`ssl_config`/DRBG 每 worker 独立）；
+证书链与客户端 CA 的解析结果进程级只读共享，吊销表也进程级共享。业务模块的 Lua 全局状态/缓存
+**按 worker 隔离**，不跨 worker 共享。当前多 worker 限制：
 
 - 端口 `0` 只允许 `workers = 1`（每个 worker 会拿到不同端口）；
 - `SIGHUP` 支持 reload：control 先校验 listen/app/TLS 证书/日志开关，再广播给所有 worker
@@ -666,7 +667,8 @@ kill -HUP $(pidof luajit-httpd)
   `enabled/access/error` 开关、app.lua 重载（路由与 Lua 文件关联尚未设计）。
 - workers>1 时同样支持 SIGHUP：control 用临时 VM 校验新配置（listen 对比启动快照、
   app 语法、TLS 证书实际加载、日志开关），通过后发布全局标量并广播 worker。每个 worker
-  在自己的 loop 里重新执行 config.lua、替换 app_ref、重建 TLS 证书代并重起检测定时器；
+  在自己的 loop 里重新执行 config.lua、替换 app_ref、重建本 worker 的 TLS 配置代（证书链/
+  CA 共享只读材料按路径与 mtime 复用，私钥/conf/DRBG 重新构建）并重起检测定时器；
   file writer 切换日志路径。校验失败保留旧配置；worker 应用失败保留该 worker 旧 app/TLS
   并记录 error。
 - 旧连接继续用旧 TLS 代/旧 handler；全局 `config` 在 reload 后指向新表（旧请求若在 reload
@@ -752,7 +754,8 @@ BENCH_REPEAT=3 bash bench/run.sh c-httpd
 - reload 不支持 listen 变化和 log 通道开关变化（会拒绝并保留旧配置）；app.lua 暂不随 reload 重载。
 - 多 worker（`server.workers > 1`）：支持 SIGHUP reload（listen/workers 数量/日志通道开关
   变化需 restart）；端口 0 不允许；Lua 全局状态按 worker 隔离；`max_connections` 按 worker 计算。
-  日志三通道/rotate 已支持；TLS 证书材料仍按 worker 各构建一份。
+  日志三通道/rotate 已支持；证书链/CA 解析结果进程级共享，私钥与 `ssl_config`/DRBG
+  每 worker 独立（mbedTLS 需以 threading 支持构建，仓库 `bench/build.sh` 已固化）。
 - `--check` 不执行 app.lua（只检查文件存在）；app 内容在启动/reload 时校验。
 - OTLP/syslog 外发是 best-effort：队列超限丢最旧、syslog 发送失败丢弃，不保证 at-least-once。
 - OTLP 暂未启用 gzip 压缩（P2）；syslog 的 RFC 5424 STRUCTURED-DATA 暂未填充（P2）。

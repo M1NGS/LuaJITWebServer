@@ -118,6 +118,10 @@ build_mbedtls() {
     rm -f "$d/src.tar.bz2"
     log "unpacked mbedtls-3.6.8 -> $d"
   fi
+  # 多 worker 模式会在线程间并发握手；mbedTLS 未启用内建锁时，4 worker/200 并发
+  # 握手会随机返回 BAD_INPUT_DATA/HANDSHAKE_FAILURE（2026-11-29 实测）。
+  run mbedtls-config-threading python3 "$d/scripts/config.py" set MBEDTLS_THREADING_C
+  run mbedtls-config-pthread python3 "$d/scripts/config.py" set MBEDTLS_THREADING_PTHREAD
   run mbedtls-cmake cmake -S "$d" -B "$d/build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \

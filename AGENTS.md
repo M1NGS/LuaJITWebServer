@@ -22,9 +22,19 @@
 ## 多 worker（线程模型）
 
 - `server.workers > 1` 时是单进程多线程：每 worker 一个 `uv_loop_t` + 一个 LuaJIT VM + 一组
-  自己 bind 的 `SO_REUSEPORT` listener；`loop`/`L`/连接链表/listener/日志 sink/TLS 证书代/
-  吊销表/shutdown 状态都是 `__thread`。新增可变全局状态时必须先判断属于哪个 worker；跨
-  worker 共享的只能是只读配置或显式原子/锁保护的结构。
+  自己 bind 的 `SO_REUSEPORT` listener；`loop`/`L`/连接链表/listener/日志 sink/TLS 配置代/
+  shutdown 状态都是 `__thread`。新增可变全局状态时必须先判断属于哪个 worker；跨 worker
+  共享的只能是只读配置或显式原子/锁保护的结构。
+- TLS 只共享只读证书材料 `tls_material_t`（证书链 + 客户端 CA 的 `mbedtls_x509_crt`，
+  `g_tls_material` 原子指针 + 引用计数 + `g_tls_material_mu`）；私钥 `mbedtls_pk_context`、
+  `mbedtls_ssl_config`、DRBG 必须每 worker 独立。**不要共享整个 ssl_config/私钥**：
+  2026-11-29 实测整代共享在 4 worker/200 并发握手出现 `BAD_SIGNATURE`。
+  mbedTLS 必须以 `MBEDTLS_THREADING_C` + `MBEDTLS_THREADING_PTHREAD` 构建（`bench/build.sh`
+  已固化）；未启用时同一负载随机返回 `BAD_INPUT_DATA`/`HANDSHAKE_FAILURE`/
+  `ERROR_CORRUPTION_DETECTED`。改动 TLS 材料/代际逻辑前先跑
+  `tests/LLM/19_tls_shared_material_test.py`（4 worker × 200 并发握手 + reload 代际）。
+  reload 的 `reload_backup_t` 会额外持有一个 material 引用用于失败回滚，恢复时用
+  `__atomic_exchange_n` + unref 旧全局引用。
 - `uv_queue_work` 的 work 回调运行在 libuv 线程池线程，**不能读提交线程的 `__thread` 变量**；
   所需配置/快照必须在提交前复制进 job（2026-11-28 吊销表与 TLS stamps 踩过这个坑）。
 - Lua 状态不可跨线程访问；`luaL_newstate`/`lua_close` 必须在所属 worker 线程。
@@ -46,3 +56,7 @@
 - 所有组件（LuaJIT、LuaRocks、libuv/luv、各 HTTP 库、压测工具等）一律从源码构建，不使用系统自带或预编译的版本。
 - 如果某个组件确实必须用 `apt` 安装，动手前必须先征得用户同意。
 - 例外：Rust 工具链（rustc/cargo，2026-11-27 经用户同意）通过 rustup 安装预编译版本，仅用于构建 httparse 的 C ABI 测试库。
+- mbedTLS 必须以 `MBEDTLS_THREADING_C` + `MBEDTLS_THREADING_PTHREAD` 构建：`bench/build.sh`
+  的 `build_mbedtls` 在 cmake 前用 `scripts/config.py set` 固化。改动该配置后必须按
+  `mbedtls → curl → c-httpd` 顺序重建（threading 改变 mbedTLS 结构体布局，curl 的静态库
+  也必须针对新头文件重编，否则 ABI 不匹配）。

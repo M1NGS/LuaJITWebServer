@@ -63,9 +63,11 @@ A/B 方式，避免阻塞事件循环。
   接收 SIGHUP/SIGINT/SIGTERM 并通过 `uv_async` 广播给 worker。
 - 每请求一个 `lua_State`（协程），C 用 `lua_resume` 驱动；`req:read()` / `res:drain()`
   在 Lua 层 `coroutine.yield`，C 在数据/水位就绪后 resume。
-- libuv 默认线程池（通常 4 线程）是**进程级共享**的，不随 worker 数增加。日志 file 写、
-  TLS 证书检测、吊销表读取都通过 `uv_queue_work` 提交；多 worker 下这些任务应只由一个
-  线程提交（P0 中 TLS/吊销表仍每 worker 各查一次，后续改为共享）。
+- libuv 默认线程池（通常 4 线程）是**进程级共享**的，不随 worker 数增加。日志写盘、
+  TLS 证书检测都通过 `uv_queue_work` 提交；吊销表只由 worker 0 定时刷新。
+  TLS 检测仍每 worker 各跑一份（各自需要换本 worker 的 conf/私钥），但证书/CA 解析结果
+  进程级共享：`tls_material_acquire()` 在全局锁内按路径 + `st_mtim` 复用同一份
+  `mbedtls_x509_crt`，避免 N 份重复解析。
 - 两个独立发送线程（OTLP / syslog）是进程级单例，多 worker P0 暂禁用。
 - 线程池任务不访问 Lua 状态；完成后通过 `uv_after_work_cb` 回到提交它的 loop。
 - 信号处理通过 control loop 的 `uv_signal_t` 进入 loop，不另起信号线程。
@@ -382,8 +384,15 @@ libuv 没有内建优雅退出；`uv_stop` 只停止 loop。实现为应用层�
 - 吊销表（P1 已完成）：进程级共享 `revoked_store_t`（原子指针 + 引用计数）；只在启动/定时
   刷新时读取文件一次，验证回调 load+ref/unref，旧表进入 retire 队列由定时器统一 free；
   不再每 worker 各加载/各起刷新 timer。
-- TLS：每 worker 基于全局路径各自构建 `tls_gen`（mbedTLS config/DRBG 不能跨线程共享），
-  证书检测 timer 也每 worker 各跑一份；material/worker-cfg 拆分是下一步。
+- TLS 证书材料（P1 已完成）：进程级共享只读 `tls_material_t`（`mbedtls_x509_crt` 证书链 +
+  客户端 CA；原子指针 + 引用计数；`tls_material_acquire()` 按证书/CA 路径与 `st_mtime`
+  在锁内判定复用，4 个 worker 的检测同时触发也只解析一次）。私钥 `mbedtls_pk_context`、
+  `mbedtls_ssl_config` 与 DRBG 每 worker 独立构建。不能共享整个 conf/pk：2026-11-29 实测
+  整代共享在 4 worker/200 并发握手时出现 `BAD_SIGNATURE`；另外 mbedTLS 构建必须启用
+  `MBEDTLS_THREADING_C` + `MBEDTLS_THREADING_PTHREAD`，未启用时同一负载随机返回
+  `BAD_INPUT_DATA`/`HANDSHAKE_FAILURE`/`ERROR_CORRUPTION_DETECTED`。
+  TLS 检测 timer 仍每 worker 各跑一份，检测到证书/私钥变化后各自重建本 worker 的 gen，
+  shared material 由各代引用计数管理。
 - reload（P1 已完成）：control loop 收到 SIGHUP 后，用临时 Lua VM + 注入字节码校验新配置：
   listen 表与启动快照逐项对比、app 只做 `luaL_loadfile` 语法检查、TLS 实际构建证书代、
   log 通道 enable/access 开关对比；通过后发布全局 `g_config/g_tcp/buffers/limits/TLS 路径`
@@ -396,8 +405,7 @@ libuv 没有内建优雅退出；`uv_stop` 只停止 loop。实现为应用层�
   （`requires restart`）；应用阶段不是全局事务（某 worker 失败只影响该 worker）。
 - 单进程内一个 worker 段错误仍会带走整个进程；SO_REUSEPORT 的已有连接不能迁移；
   `max_connections` 按 worker 计算；尚无 eBPF 分流/绑核。
-- 后续（P1/P2）：TLS 材料共享（证书/私钥/CA 解析一次 + per-worker conf/DRBG）、每 worker
-  统计与连接配额、绑核/jemalloc 调参、`lua_shared_dict`。
+- 后续（P2）：每 worker 统计与连接配额、绑核/jemalloc 调参、`lua_shared_dict`。
 
 ## 13. 配置模型
 
@@ -505,9 +513,11 @@ LuaJIT 是共享库，运行时需要 `LD_LIBRARY_PATH=prefix/luajit/lib`。
 | `tests/LLM/12_log_sinks_test.py` | file/OTLP/syslog 三通道、过滤、批量/重试、syslog 传输 |
 | `tests/LLM/13_ffi_config_test.py` | 普通 table 隐式 FFI 配置、ABI、库/C 校验 |
 | `tests/LLM/14_reload_test.py` | `--check`、SIGHUP reload、失败回滚、listen 变化拒绝 |
-| `tests/LLM/15_multiworker_test.py` | workers=4、SO_REUSEPORT、并发、日志、SIGHUP 拒绝、退出 |
+| `tests/LLM/15_multiworker_test.py` | workers=4、SO_REUSEPORT、并发、日志、SIGHUP reload、退出 |
 | `tests/LLM/16_log_pipeline_test.py` | 多 worker 日志 ring/collector/file writer、三通道、rotate |
 | `tests/LLM/17_chunked_request_test.py` | chunked 上传/回显、trailer、跨包、TE 校验、丢弃后 keep-alive、413 |
+| `tests/LLM/18_multiworker_reload_test.py` | 多 worker SIGHUP：app/日志路径/TLS 证书重载、拒绝变化 |
+| `tests/LLM/19_tls_shared_material_test.py` | 4 worker 共享证书材料：200 并发 TLS1.2/1.3 握手、reload 后代际并发 |
 | `tests/HUMAN/01_req_body_tristate_test.py` | body 三态语义（人工确认） |
 | `tests/HUMAN/02_shutdown_contract_test.py` | 优雅退出契约（人工确认） |
 | `bench/tests/pico_robust.py` | pico/luv 辅助服务器健壮性 |

@@ -145,16 +145,23 @@ handler 仍由 Lua 执行；`kind="upload"` 与 C 层 multipart 上传联动。
 - 每 worker 隔离：连接、协程、listeners、日志 file sink、TLS 证书代、吊销表；全局配置/
   证书路径只读。
 - 当前多 worker 限制：端口 0 只允许 workers=1；`max_connections` 按 worker 计算；
-  listen/workers 数量/日志通道开关变化需 restart；已有连接不能迁移；TLS 证书代仍每 worker 一份。
+  listen/workers 数量/日志通道开关变化需 restart；已有连接不能迁移；TLS 证书链/CA 共享只读，
+  私钥与 ssl_config/DRBG 每 worker 独立。
 - 测试：`tests/LLM/15_multiworker_test.py`（10 用例），全量 20 套件通过。
 - P1 已完成（2026-11-28）：per-worker SPSC ring（access 1 MiB / error 64 KiB）+ 单 collector
   按 targets 位图分发；file writer 单写者写盘/rotate；OTLP/syslog 发送线程从 collector 入队；
   关闭顺序 worker→collector→file→发送线程；多 worker 三通道和内置 rotate 已启用。
   吊销表改为进程级共享（原子指针 + 引用计数 + retire 队列），只加载/刷新一次。
-- P1 待做：TLS 材料共享。2026-11-29 实测：把 `mbedtls_ssl_config`/证书/私钥做进程级共享、
-  每 worker 只用线程局部 DRBG，4 worker 200 并发握手出现 `BAD_SIGNATURE`（仅 31 成功），
-  已回退到 per-worker 证书代。mbedTLS 的 conf/pk 不能跨线程共享；若继续只能共享只读
-  `mbedtls_x509_crt`/CA、pk/conf 每 worker 独立，且必须做并发握手验证。
+- P1 已完成（2026-11-29）：TLS 材料共享。共享只读 `mbedtls_x509_crt` 证书链/客户端 CA
+  （`g_tls_material` 原子指针 + 引用计数，`tls_material_acquire()` 在全局锁内按路径 +
+  `st_mtime` 复用，worker 检测同时触发也只解析一次）；私钥 `mbedtls_pk_context`、
+  `mbedtls_ssl_config`、DRBG 每 worker 独立。实测结论：
+  整代共享（conf+cert+pk）在 4 worker/200 并发握手出现 `BAD_SIGNATURE`（仅 31 成功），
+  不可行；另外 mbedTLS 必须以 `MBEDTLS_THREADING_C` + `MBEDTLS_THREADING_PTHREAD` 构建，
+  否则同一负载随机返回 `BAD_INPUT_DATA`/`HANDSHAKE_FAILURE`/`ERROR_CORRUPTION_DETECTED`
+  （`bench/build.sh` 已固化）。
+  验证：`tests/LLM/19_tls_shared_material_test.py`（200 并发 TLS1.3、TLS1.2/1.3 混合、
+  reload 代际后再 200 并发；连续 10 轮通过，全量 21/21）。
 - P1 待做：每 worker 统计与连接配额、连接分布监控。
 - P2：`SO_ATTACH_REUSEPORT_EBPF` 按 CPU 分流（已评估，复杂度/不确定性高，暂不做）、
   绑核、jemalloc 调参、`lua_shared_dict`（业务跨 worker KV，尚未设计）。
@@ -173,9 +180,9 @@ handler 仍由 Lua 执行；`kind="upload"` 与 C 层 multipart 上传联动。
 
 ### 高优先级
 
-- [ ] TLS 材料安全共享：共享只读 `mbedtls_x509_crt`/CA，`pk`/`conf`/DRBG 每 worker 独立；
-  合并前必须做 4 worker × 200 并发握手验证。共享整个 `ssl_config`+`pk` 已实测并发
-  `BAD_SIGNATURE`，不可行（见第 10 节）。
+- [x] TLS 材料共享（2026-11-29）：共享只读 `mbedtls_x509_crt`/CA，`pk`/`conf`/DRBG 每 worker
+  独立；测试 `19_tls_shared_material_test.py` 覆盖 4 worker × 200 并发握手与 reload 代际
+  （见第 10 节；整代共享已因 `BAD_SIGNATURE` 否决）。
 - [ ] `routes`/`uploader` 配置（第 3 节）：先定格式（path/method/kind/handler），C 编译路由表，
   Lua handler 绑定，`kind="upload"` 与 multipart 联动。
 - [ ] C 层流式 multipart 上传（第 1 节 P1，尚未开始）。

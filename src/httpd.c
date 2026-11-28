@@ -197,24 +197,50 @@ static const tcp_opts_t k_tcp_defaults = { 1, 0, 60, 10, 5, 0, 1024, 0, 0, 0 };
 
 static tcp_opts_t g_tcp;
 
-/* ---------- TLS（mbedTLS 3.6）：证书代，支持 SNI 与热轮换 ---------- */
-typedef struct tls_cert_pair_s {
+/* ---------- TLS（mbedTLS 3.6）：共享证书材料 + 每 worker 配置代 ---------- */
+
+/* 证书/CA 文件的时间戳快照（定时检测 + 共享材料代匹配） */
+typedef struct {
+  time_t sec;
+  long nsec;
+  int valid;
+} tls_stamp_t;
+
+#define MAX_SNI_CERTS 32
+#define MAX_TLS_MATERIAL_PATHS (2 + MAX_SNI_CERTS * 2)
+
+/* 进程级共享的只读证书材料：证书链与客户端 CA 只解析一次，所有 worker 只读复用。
+ * 不能共享整个 ssl_config/私钥：2026-11-29 实测 4 worker/200 并发握手出现
+ * BAD_SIGNATURE（mbedTLS 的 conf 与 pk_context 跨线程并发使用不安全）。
+ * 因此这里只提供 x509_crt（只读解析结果），私钥 pk_context、conf、DRBG 每 worker 一份。 */
+typedef struct tls_material_sni_s {
   char server_name[128];
   mbedtls_x509_crt cert;
-  mbedtls_pk_context key;
   mbedtls_x509_crt ca;       /* 该 SNI 自己的客户端 CA（可选） */
   int has_ca;
   int client_auth;           /* 该 SNI 生效的客户端证书要求 */
-} tls_cert_pair_t;
+} tls_material_sni_t;
 
-typedef struct tls_gen_s {
-  mbedtls_ssl_config conf;
+typedef struct tls_material_s {
   mbedtls_x509_crt default_cert;
-  mbedtls_pk_context default_key;
   mbedtls_x509_crt ca;
   int has_ca;
-  tls_cert_pair_t *sni;
+  tls_material_sni_t *sni;
   size_t sni_count;
+  char paths[MAX_TLS_MATERIAL_PATHS][512];
+  tls_stamp_t stamps[MAX_TLS_MATERIAL_PATHS];
+  size_t path_count;
+  _Atomic int refs;
+} tls_material_t;
+
+static _Atomic(tls_material_t *) g_tls_material;   /* 全局持 1 个引用 */
+static uv_mutex_t g_tls_material_mu;               /* 保护材料构建与发布 */
+
+typedef struct tls_gen_s {
+  mbedtls_ssl_config conf;         /* 每 worker 独立（含 RNG 回调） */
+  mbedtls_pk_context default_key;  /* 每 worker 独立解析 */
+  mbedtls_pk_context *sni_keys;    /* 与 mat->sni 一一对应；每 worker 独立 */
+  tls_material_t *mat;             /* 持有一个引用（证书/CA 只读共享） */
   mbedtls_entropy_context entropy;
   mbedtls_ctr_drbg_context drbg;
   int refs;
@@ -233,7 +259,6 @@ static char g_tls_alpn_buf[8][64];
 static const char *g_tls_alpn[9];
 static int g_tls_alpn_count;
 
-#define MAX_SNI_CERTS 32
 static char g_sni_names[MAX_SNI_CERTS][128];
 static char g_sni_cert_paths[MAX_SNI_CERTS][512];
 static char g_sni_key_paths[MAX_SNI_CERTS][512];
@@ -243,11 +268,6 @@ static size_t g_sni_count;
 
 /* 定时 st_mtime 检测：路径列表 + 上次快照 */
 #define MAX_TLS_PATHS (3 + MAX_SNI_CERTS * 3)
-typedef struct {
-  time_t sec;
-  long nsec;
-  int valid;
-} tls_stamp_t;
 static char g_tls_paths[MAX_TLS_PATHS][512];
 static size_t g_tls_path_count;
 static __thread tls_stamp_t g_tls_stamps[MAX_TLS_PATHS];
@@ -4718,21 +4738,218 @@ static void parse_tls(lua_State *l, int sidx)
   lua_pop(l, 1); /* tls */
 }
 
+static void tls_report(int ret, char *buf, size_t n)
+{
+  if (ret > 0) snprintf(buf, n, "%d certificate(s) failed to parse", ret);
+  else mbedtls_strerror(ret, buf, n);
+}
+
+/* 只记录错误，不退出：材料构建可能发生在全局锁内，长跳转会泄漏锁；
+ * 启动/reload 的错误统一由 parse_server 的 die()（启动退出 / reload longjmp）处理。 */
+static void tls_msg(int fatal, const char *fmt, ...)
+{
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(tls_errbuf, sizeof(tls_errbuf), fmt, ap);
+  va_end(ap);
+  if (fatal) log_error(LOG_ERROR, "tls: %s", tls_errbuf);
+}
+
+/* ---------- 共享证书材料：构建 / 缓存 / 引用计数 ---------- */
+
+static void tls_material_free(tls_material_t *m)
+{
+  if (!m) return;
+  for (size_t i = 0; i < m->sni_count; i++) {
+    mbedtls_x509_crt_free(&m->sni[i].cert);
+    if (m->sni[i].has_ca) mbedtls_x509_crt_free(&m->sni[i].ca);
+  }
+  free(m->sni);
+  mbedtls_x509_crt_free(&m->default_cert);
+  if (m->has_ca) mbedtls_x509_crt_free(&m->ca);
+  free(m);
+}
+
+static void tls_material_ref(tls_material_t *m)
+{
+  if (m) __atomic_add_fetch(&m->refs, 1, __ATOMIC_RELAXED);
+}
+
+static void tls_material_unref(tls_material_t *m)
+{
+  if (m && __atomic_sub_fetch(&m->refs, 1, __ATOMIC_ACQ_REL) == 0)
+    tls_material_free(m);
+}
+
+/* 只有证书/CA 参与共享材料；私钥每 worker 自行解析，不进路径集合 */
+static size_t tls_material_path_add(char paths[][512], size_t n, const char *p)
+{
+  if (!p || !p[0] || n >= MAX_TLS_MATERIAL_PATHS) return n;
+  snprintf(paths[n], sizeof(paths[0]), "%s", p);
+  return n + 1;
+}
+
+static size_t tls_material_paths_collect(char paths[][512])
+{
+  size_t n = 0;
+  n = tls_material_path_add(paths, n, g_tls_cert_path);
+  n = tls_material_path_add(paths, n, g_tls_ca_path);
+  for (size_t i = 0; i < g_sni_count; i++) {
+    n = tls_material_path_add(paths, n, g_sni_cert_paths[i]);
+    n = tls_material_path_add(paths, n, g_sni_ca_paths[i]);
+  }
+  return n;
+}
+
+static int tls_material_matches(tls_material_t *m, char paths[][512],
+                                const tls_stamp_t *stamps, size_t n)
+{
+  if (m->path_count != n) return 0;
+  for (size_t i = 0; i < n; i++) {
+    if (strcmp(m->paths[i], paths[i]) != 0) return 0;
+    if (!m->stamps[i].valid || !stamps[i].valid) return 0;
+    if (m->stamps[i].sec != stamps[i].sec || m->stamps[i].nsec != stamps[i].nsec)
+      return 0;
+  }
+  return 1;
+}
+
+static tls_material_t *tls_material_build(int fatal, char paths[][512],
+                                          const tls_stamp_t *stamps, size_t n)
+{
+  int ret;
+  char err[128];
+  tls_material_t *m = (tls_material_t *)calloc(1, sizeof(*m));
+  if (!m) { tls_msg(fatal, "out of memory"); return NULL; }
+
+  mbedtls_x509_crt_init(&m->default_cert);
+  m->path_count = n;
+  for (size_t i = 0; i < n; i++) {
+    snprintf(m->paths[i], sizeof(m->paths[0]), "%s", paths[i]);
+    m->stamps[i] = stamps[i];
+  }
+
+  ret = mbedtls_x509_crt_parse_file(&m->default_cert, g_tls_cert_path);
+  if (ret != 0) {
+    tls_report(ret, err, sizeof(err));
+    tls_msg(fatal, "cannot load cert %s: %s", g_tls_cert_path, err);
+    goto fail;
+  }
+
+  if (g_tls_ca_path[0]) {
+    m->has_ca = 1;
+    mbedtls_x509_crt_init(&m->ca);
+    ret = mbedtls_x509_crt_parse_file(&m->ca, g_tls_ca_path);
+    if (ret != 0) {
+      tls_report(ret, err, sizeof(err));
+      tls_msg(fatal, "cannot load ca %s: %s", g_tls_ca_path, err);
+      goto fail;
+    }
+  } else if (g_tls_client_auth) {
+    tls_msg(fatal, "client_auth requires tls.ca");
+    goto fail;
+  }
+
+  if (g_sni_count) {
+    m->sni = (tls_material_sni_t *)calloc(g_sni_count, sizeof(tls_material_sni_t));
+    if (!m->sni) { tls_msg(fatal, "out of memory for sni certs"); goto fail; }
+    m->sni_count = g_sni_count;
+    for (size_t i = 0; i < m->sni_count; i++) {
+      mbedtls_x509_crt_init(&m->sni[i].cert);
+      if (g_sni_ca_paths[i][0]) {
+        m->sni[i].has_ca = 1;
+        mbedtls_x509_crt_init(&m->sni[i].ca);
+      }
+    }
+    for (size_t i = 0; i < m->sni_count; i++) {
+      snprintf(m->sni[i].server_name, sizeof(m->sni[i].server_name), "%s",
+               g_sni_names[i]);
+      ret = mbedtls_x509_crt_parse_file(&m->sni[i].cert, g_sni_cert_paths[i]);
+      if (ret != 0) {
+        tls_report(ret, err, sizeof(err));
+        tls_msg(fatal, "cannot load sni cert %s: %s", g_sni_cert_paths[i], err);
+        goto fail;
+      }
+      m->sni[i].client_auth = g_sni_client_auth[i] >= 0
+          ? g_sni_client_auth[i] : g_tls_client_auth;
+      if (m->sni[i].has_ca) {
+        ret = mbedtls_x509_crt_parse_file(&m->sni[i].ca, g_sni_ca_paths[i]);
+        if (ret != 0) {
+          tls_report(ret, err, sizeof(err));
+          tls_msg(fatal, "cannot load sni ca %s: %s", g_sni_ca_paths[i], err);
+          goto fail;
+        }
+      }
+      if (m->sni[i].client_auth && !m->sni[i].has_ca && !m->has_ca) {
+        tls_msg(fatal, "tls.sni[%zu] client_auth requires ca", i);
+        goto fail;
+      }
+    }
+  }
+  return m;
+
+fail:
+  tls_material_free(m);
+  return NULL;
+}
+
+/* 返回持有一个引用的材料；证书/CA 文件未变化时复用全局代。
+ * 4 个 worker 的定时检测可能同时触发，锁内二次比较保证只解析一次。 */
+static tls_material_t *tls_material_acquire(int fatal)
+{
+  char paths[MAX_TLS_MATERIAL_PATHS][512];
+  tls_stamp_t stamps[MAX_TLS_MATERIAL_PATHS];
+  size_t n = tls_material_paths_collect(paths);
+
+  for (size_t i = 0; i < n; i++) {
+    struct stat st;
+    if (stat(paths[i], &st) != 0) {
+      tls_msg(fatal, "cannot stat %s: %s", paths[i], strerror(errno));
+      return NULL;
+    }
+    stamps[i].valid = 1;
+    stamps[i].sec = st.st_mtim.tv_sec;
+    stamps[i].nsec = st.st_mtim.tv_nsec;
+  }
+  if (n == 0) {
+    tls_msg(fatal, "tls cert path missing");
+    return NULL;
+  }
+
+  uv_mutex_lock(&g_tls_material_mu);
+  tls_material_t *cur = __atomic_load_n(&g_tls_material, __ATOMIC_ACQUIRE);
+  if (cur && tls_material_matches(cur, paths, stamps, n)) {
+    tls_material_ref(cur);
+    uv_mutex_unlock(&g_tls_material_mu);
+    return cur;
+  }
+
+  tls_material_t *m = tls_material_build(fatal, paths, stamps, n);
+  if (!m) {
+    uv_mutex_unlock(&g_tls_material_mu);
+    return NULL;
+  }
+  tls_material_ref(m);   /* 全局发布持有的引用 */
+  cur = __atomic_exchange_n(&g_tls_material, m, __ATOMIC_ACQ_REL);
+  if (cur) tls_material_unref(cur);
+  tls_material_ref(m);   /* 返回给调用方（tls_gen_t）的引用 */
+  uv_mutex_unlock(&g_tls_material_mu);
+  return m;
+}
+
 static void tls_gen_free(tls_gen_t *g)
 {
   if (!g) return;
   mbedtls_ssl_config_free(&g->conf);
-  for (size_t i = 0; i < g->sni_count; i++) {
-    mbedtls_x509_crt_free(&g->sni[i].cert);
-    mbedtls_pk_free(&g->sni[i].key);
-    if (g->sni[i].has_ca) mbedtls_x509_crt_free(&g->sni[i].ca);
+  if (g->sni_keys) {
+    size_t n = g->mat ? g->mat->sni_count : 0;
+    for (size_t i = 0; i < n; i++) mbedtls_pk_free(&g->sni_keys[i]);
+    free(g->sni_keys);
   }
-  free(g->sni);
-  mbedtls_x509_crt_free(&g->default_cert);
   mbedtls_pk_free(&g->default_key);
-  if (g->has_ca) mbedtls_x509_crt_free(&g->ca);
   mbedtls_ctr_drbg_free(&g->drbg);
   mbedtls_entropy_free(&g->entropy);
+  tls_material_unref(g->mat);
   free(g);
 }
 
@@ -4746,33 +4963,16 @@ static void tls_gen_unref(tls_gen_t *g)
   if (g && --g->refs == 0) tls_gen_free(g);
 }
 
-static void tls_report(int ret, char *buf, size_t n)
-{
-  if (ret > 0) snprintf(buf, n, "%d certificate(s) failed to parse", ret);
-  else mbedtls_strerror(ret, buf, n);
-}
-
-static void tls_msg(int fatal, const char *fmt, ...)
-{
-  va_list ap;
-  va_start(ap, fmt);
-  vsnprintf(tls_errbuf, sizeof(tls_errbuf), fmt, ap);
-  va_end(ap);
-  if (fatal) {
-    log_error(LOG_ERROR, "tls: %s", tls_errbuf);
-    exit(1);
-  }
-}
-
 /* 服务端 SNI：精确名优先，其次 *.suffix 通配（只匹配一级标签） */
-static int tls_apply_pair(mbedtls_ssl_context *ssl, tls_gen_t *g, tls_cert_pair_t *pair)
+static int tls_apply_pair(mbedtls_ssl_context *ssl, tls_gen_t *g, size_t idx)
 {
-  int rc = mbedtls_ssl_set_hs_own_cert(ssl, &pair->cert, &pair->key);
+  tls_material_sni_t *pair = &g->mat->sni[idx];
+  int rc = mbedtls_ssl_set_hs_own_cert(ssl, &pair->cert, &g->sni_keys[idx]);
   if (rc != 0) return rc;
   if (pair->has_ca) {
     mbedtls_ssl_set_hs_ca_chain(ssl, &pair->ca, NULL);
-  } else if (g->has_ca) {
-    mbedtls_ssl_set_hs_ca_chain(ssl, &g->ca, NULL);
+  } else if (g->mat->has_ca) {
+    mbedtls_ssl_set_hs_ca_chain(ssl, &g->mat->ca, NULL);
   }
   mbedtls_ssl_set_hs_authmode(ssl, pair->client_auth
       ? MBEDTLS_SSL_VERIFY_REQUIRED : MBEDTLS_SSL_VERIFY_NONE);
@@ -4783,18 +4983,18 @@ static int tls_sni_cb(void *p, mbedtls_ssl_context *ssl,
                       const unsigned char *name, size_t len)
 {
   tls_gen_t *g = (tls_gen_t *)p;
-  if (!g || len == 0 || len >= 128) return 0;
+  if (!g || !g->mat || len == 0 || len >= 128) return 0;
   char host[128];
   memcpy(host, name, len);
   host[len] = 0;
 
-  for (size_t i = 0; i < g->sni_count; i++) {
-    if (strcasecmp(host, g->sni[i].server_name) == 0) {
-      return tls_apply_pair(ssl, g, &g->sni[i]);
+  for (size_t i = 0; i < g->mat->sni_count; i++) {
+    if (strcasecmp(host, g->mat->sni[i].server_name) == 0) {
+      return tls_apply_pair(ssl, g, i);
     }
   }
-  for (size_t i = 0; i < g->sni_count; i++) {
-    const char *pat = g->sni[i].server_name;
+  for (size_t i = 0; i < g->mat->sni_count; i++) {
+    const char *pat = g->mat->sni[i].server_name;
     if (strncmp(pat, "*.", 2) != 0) continue;
     const char *suffix = pat + 2;
     size_t hl = strlen(host), sl = strlen(suffix);
@@ -4802,7 +5002,7 @@ static int tls_sni_cb(void *p, mbedtls_ssl_context *ssl,
     if (strcasecmp(host + hl - sl, suffix) != 0) continue;
     /* 通配只匹配一级标签：a.example.com 可以，a.b.example.com 不行 */
     if (memchr(host, '.', hl - sl - 1) != NULL) continue;
-    return tls_apply_pair(ssl, g, &g->sni[i]);
+    return tls_apply_pair(ssl, g, i);
   }
   return 0; /* 使用默认证书 + 全局 mTLS 策略 */
 }
@@ -5142,11 +5342,18 @@ static tls_gen_t *tls_gen_build(int fatal)
 {
   int ret;
   char err[128];
+  tls_material_t *mat = tls_material_acquire(fatal);
+  if (!mat) return NULL;
+
   tls_gen_t *g = (tls_gen_t *)calloc(1, sizeof(*g));
-  if (!g) { tls_msg(fatal, "out of memory"); return NULL; }
+  if (!g) {
+    tls_material_unref(mat);
+    tls_msg(fatal, "out of memory");
+    return NULL;
+  }
+  g->mat = mat;
 
   mbedtls_ssl_config_init(&g->conf);
-  mbedtls_x509_crt_init(&g->default_cert);
   mbedtls_pk_init(&g->default_key);
   mbedtls_entropy_init(&g->entropy);
   mbedtls_ctr_drbg_init(&g->drbg);
@@ -5159,13 +5366,6 @@ static tls_gen_t *tls_gen_build(int fatal)
     tls_msg(fatal, "ctr_drbg_seed: %s", err);
     goto fail;
   }
-
-  ret = mbedtls_x509_crt_parse_file(&g->default_cert, g_tls_cert_path);
-  if (ret != 0) {
-    tls_report(ret, err, sizeof(err));
-    tls_msg(fatal, "cannot load cert %s: %s", g_tls_cert_path, err);
-    goto fail;
-  }
   ret = mbedtls_pk_parse_keyfile(&g->default_key, g_tls_key_path, NULL, NULL, NULL);
   if (ret != 0) {
     tls_report(ret, err, sizeof(err));
@@ -5173,59 +5373,17 @@ static tls_gen_t *tls_gen_build(int fatal)
     goto fail;
   }
 
-  if (g_tls_ca_path[0]) {
-    mbedtls_x509_crt_init(&g->ca);
-    g->has_ca = 1;
-    ret = mbedtls_x509_crt_parse_file(&g->ca, g_tls_ca_path);
-    if (ret != 0) {
-      tls_report(ret, err, sizeof(err));
-      tls_msg(fatal, "cannot load ca %s: %s", g_tls_ca_path, err);
-      goto fail;
-    }
-  } else if (g_tls_client_auth) {
-    tls_msg(fatal, "client_auth requires tls.ca");
-    goto fail;
-  }
-
-  if (g_sni_count) {
-    g->sni = (tls_cert_pair_t *)calloc(g_sni_count, sizeof(tls_cert_pair_t));
-    if (!g->sni) { tls_msg(fatal, "out of memory for sni certs"); goto fail; }
-    g->sni_count = g_sni_count;
-    for (size_t i = 0; i < g->sni_count; i++) {
-      mbedtls_x509_crt_init(&g->sni[i].cert);
-      mbedtls_pk_init(&g->sni[i].key);
-    }
-    for (size_t i = 0; i < g->sni_count; i++) {
-      snprintf(g->sni[i].server_name, sizeof(g->sni[i].server_name), "%s",
-               g_sni_names[i]);
-      ret = mbedtls_x509_crt_parse_file(&g->sni[i].cert, g_sni_cert_paths[i]);
-      if (ret != 0) {
-        tls_report(ret, err, sizeof(err));
-        tls_msg(fatal, "cannot load sni cert %s: %s", g_sni_cert_paths[i], err);
-        goto fail;
-      }
-      ret = mbedtls_pk_parse_keyfile(&g->sni[i].key, g_sni_key_paths[i],
+  if (mat->sni_count) {
+    g->sni_keys = (mbedtls_pk_context *)calloc(mat->sni_count,
+                                               sizeof(mbedtls_pk_context));
+    if (!g->sni_keys) { tls_msg(fatal, "out of memory for sni keys"); goto fail; }
+    for (size_t i = 0; i < mat->sni_count; i++) {
+      mbedtls_pk_init(&g->sni_keys[i]);
+      ret = mbedtls_pk_parse_keyfile(&g->sni_keys[i], g_sni_key_paths[i],
                                      NULL, NULL, NULL);
       if (ret != 0) {
         tls_report(ret, err, sizeof(err));
         tls_msg(fatal, "cannot load sni key %s: %s", g_sni_key_paths[i], err);
-        goto fail;
-      }
-
-      g->sni[i].client_auth = g_sni_client_auth[i] >= 0
-          ? g_sni_client_auth[i] : g_tls_client_auth;
-      if (g_sni_ca_paths[i][0]) {
-        g->sni[i].has_ca = 1;
-        mbedtls_x509_crt_init(&g->sni[i].ca);
-        ret = mbedtls_x509_crt_parse_file(&g->sni[i].ca, g_sni_ca_paths[i]);
-        if (ret != 0) {
-          tls_report(ret, err, sizeof(err));
-          tls_msg(fatal, "cannot load sni ca %s: %s", g_sni_ca_paths[i], err);
-          goto fail;
-        }
-      }
-      if (g->sni[i].client_auth && !g->sni[i].has_ca && !g->has_ca) {
-        tls_msg(fatal, "tls.sni[%zu] client_auth requires ca", i);
         goto fail;
       }
     }
@@ -5244,22 +5402,21 @@ static tls_gen_t *tls_gen_build(int fatal)
   mbedtls_ssl_conf_min_tls_version(&g->conf,
       g_tls_min13 ? MBEDTLS_SSL_VERSION_TLS1_3 : MBEDTLS_SSL_VERSION_TLS1_2);
 
-  if (g->has_ca) mbedtls_ssl_conf_ca_chain(&g->conf, &g->ca, NULL);
+  if (mat->has_ca) mbedtls_ssl_conf_ca_chain(&g->conf, &mat->ca, NULL);
   mbedtls_ssl_conf_authmode(&g->conf, g_tls_client_auth
       ? MBEDTLS_SSL_VERIFY_REQUIRED : MBEDTLS_SSL_VERIFY_NONE);
 
-  ret = mbedtls_ssl_conf_own_cert(&g->conf, &g->default_cert, &g->default_key);
+  ret = mbedtls_ssl_conf_own_cert(&g->conf, &mat->default_cert, &g->default_key);
   if (ret != 0) {
     tls_report(ret, err, sizeof(err));
     tls_msg(fatal, "ssl_conf_own_cert: %s", err);
     goto fail;
   }
-  if (g->sni_count) mbedtls_ssl_conf_sni(&g->conf, tls_sni_cb, g);
+  if (mat->sni_count) mbedtls_ssl_conf_sni(&g->conf, tls_sni_cb, g);
   if (g_tls_alpn_count) mbedtls_ssl_conf_alpn_protocols(&g->conf, g_tls_alpn);
   return g;
 
 fail:
-  if (fatal) exit(1);
   tls_gen_free(g);
   return NULL;
 }
@@ -5984,8 +6141,11 @@ static void parse_server(lua_State *l, int sidx, int cli_port)
     if (!g_tls_cert_path[0] || !g_tls_key_path[0])
       die("server.tls.cert and server.tls.key are required for a tls listener");
     g_tls_enabled = 1;
-    g_tls_gen = tls_gen_build(1);
-    if (!g_tls_gen) die("failed to build TLS configuration");
+    /* reload 上下文（g_cfg_jmp 非空）下不能 exit：构建失败由 die() 长跳转回滚 */
+    g_tls_gen = tls_gen_build(g_cfg_jmp ? 0 : 1);
+    if (!g_tls_gen)
+      die("failed to build TLS configuration: %s",
+          tls_errbuf[0] ? tls_errbuf : "unknown error");
     tls_gen_ref(g_tls_gen);
   }
 }
@@ -6240,6 +6400,7 @@ typedef struct {
   int tls_check_interval_ms;
   int tls_enabled;
   tls_gen_t *tls_gen;
+  tls_material_t *tls_material;   /* 额外持 1 个引用，供失败回滚 */
   revocation_cfg_t revocation;
   int config_ref;
   int used_before;
@@ -6280,6 +6441,8 @@ static void reload_save(reload_backup_t *b)
   b->tls_check_interval_ms = g_tls_check_interval_ms;
   b->tls_enabled = g_tls_enabled;
   b->tls_gen = g_tls_gen;
+  b->tls_material = __atomic_load_n(&g_tls_material, __ATOMIC_ACQUIRE);
+  if (b->tls_material) tls_material_ref(b->tls_material);
   b->revocation = g_revocation;
 
   lua_getglobal(L, "__httpd_config_used");
@@ -6324,6 +6487,13 @@ static void reload_restore(reload_backup_t *b)
   g_tls_check_interval_ms = b->tls_check_interval_ms;
   g_tls_enabled = b->tls_enabled;
   g_tls_gen = b->tls_gen;
+  {
+    /* 备份引用转移成新的全局引用；当前全局引用在 exchange 后释放 */
+    tls_material_t *cur = __atomic_exchange_n(&g_tls_material, b->tls_material,
+                                              __ATOMIC_ACQ_REL);
+    if (cur) tls_material_unref(cur);
+    b->tls_material = NULL;
+  }
   g_revocation = b->revocation;
 
   if (b->config_ref != LUA_NOREF && b->config_ref != LUA_REFNIL) {
@@ -6526,6 +6696,10 @@ static void reload_config(void)
   g_listener_count = b.listener_count;
 
   if (b.tls_gen) tls_gen_unref(b.tls_gen);
+  if (b.tls_material) {
+    tls_material_unref(b.tls_material);
+    b.tls_material = NULL;
+  }
 
   log_reload_apply(&g_config.log);
   revocation_reconfigure();
@@ -6909,6 +7083,10 @@ static int multi_reload_config(void)
   g_listener_count = 0;
   if (g_tls_gen) { tls_gen_unref(g_tls_gen); g_tls_gen = NULL; }
   if (b.tls_gen) tls_gen_unref(b.tls_gen);
+  if (b.tls_material) {
+    tls_material_unref(b.tls_material);
+    b.tls_material = NULL;
+  }
   lua_settop(L, base);
   if (b.config_ref != LUA_NOREF && b.config_ref != LUA_REFNIL) {
     luaL_unref(L, LUA_REGISTRYINDEX, b.config_ref);
@@ -7045,6 +7223,11 @@ int main(int argc, char **argv)
   if (mb && *mb) {
     unsigned long long v = strtoull(mb, NULL, 10);
     if (v > 0) g_env_max_body = (size_t)v;
+  }
+
+  if (uv_mutex_init(&g_tls_material_mu) != 0) {
+    fprintf(stderr, "tls: cannot initialize shared material mutex\n");
+    return 1;
   }
 
   signal(SIGPIPE, SIG_IGN);

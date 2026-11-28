@@ -3,7 +3,7 @@
 本目录是 `luajit-httpd` 的功能回归测试套件。每个测试脚本都是**独立可运行**的：自动选择空闲端口、
 创建临时目录/配置/证书、启动自己的服务器进程、执行用例、停止进程并清理，不依赖预先启动的服务。
 
-当前共 20 个套件（18 个 LLM + 2 个 HUMAN），`python3 -I tests/run_all.py` 全部通过。
+当前共 21 个套件（19 个 LLM + 2 个 HUMAN），`python3 -I tests/run_all.py` 全部通过。
 
 ## 目录
 
@@ -76,10 +76,11 @@ python3 -I tests/HUMAN/02_shutdown_contract_test.py
 | `LLM/12_log_sinks_test.py` | file/OTLP/syslog 三通道开关与过滤；OTLP protobuf 字段映射、批量/门限触发、500 重试、本地留存；syslog UDP/TCP/TLS/unix、RFC 5424/3164 |
 | `LLM/13_ffi_config_test.py` | 普通 table 配置被 C 隐式交给字节码库（`httpd_config.load`）写 log 三通道、ABI 断言、库层参数校验、C finalize 校验、平铺/方法写法兼容、无 return 的全局 config |
 | `LLM/14_reload_test.py` | `--check` 成功/语法错/缺 endpoint/缺证书/日志路径不可写/缺 app、不绑定运行中端口；SIGHUP reload 路径切换、失败回滚、listen 变化拒绝、TLS 证书重载 |
-| `LLM/15_multiworker_test.py` | `server.workers=4` 启动、64 并发、access 日志完整、线程数、`reuse_port=1`、SIGHUP 拒绝、SIGTERM 退出 0、端口 0 + workers>1 拒绝 |
+| `LLM/15_multiworker_test.py` | `server.workers=4` 启动、64 并发、access 日志完整、线程数、`reuse_port=1`、SIGHUP reload、SIGTERM 退出 0、端口 0 + workers>1 拒绝 |
 | `LLM/16_log_pipeline_test.py` | 4 worker 日志管道：file/OTLP/syslog 汇总、rotate、优雅退出后行数完整 |
 | `LLM/17_chunked_request_test.py` | chunked 上传/回显、trailer、跨包 size、HTTP/1.0 TE/非 chunked/CL+TE 拒绝、丢弃后 keep-alive、超 max_body 413 |
 | `LLM/18_multiworker_reload_test.py` | 多 worker SIGHUP：app 替换、日志路径切换、TLS 证书重载、listen/日志开关/坏 app 拒绝 |
+| `LLM/19_tls_shared_material_test.py` | 4 worker 共享证书材料的并发正确性：200 并发 TLS1.3、TLS1.2/1.3 混合、SIGHUP 代际切换后再 200 并发握手，全部成功且证书代正确 |
 | `HUMAN/01_req_body_tristate_test.py` | 用户质疑的 `req.body == nil` 歧义：无 body / 小 body / 大 body 的 `has_body/body_size/streaming/buffered` 与 GET `/echo` 400 |
 | `HUMAN/02_shutdown_contract_test.py` | 用户确认的退出契约：首次 SIGINT 关闭监听/空闲连接、新连接拒绝；在飞请求受 `shutdown_timeout` 约束 |
 
@@ -104,6 +105,7 @@ python3 -I tests/HUMAN/02_shutdown_contract_test.py
 | 配置检查 / 热重载 | 14, 18 |
 | 多 worker（SO_REUSEPORT） | 15, 18 |
 | 多 worker 日志管道（ring/collector/file writer） | 16 |
+| 多 worker 共享 TLS 材料并发 | 19 |
 | 优雅退出 | HUMAN/02 |
 | 配置校验/默认值 | 09, 11 |
 | TCP 选项/旧模式 | 10 |
@@ -129,7 +131,7 @@ python3 -I tests/HUMAN/02_shutdown_contract_test.py
 - OTLP gzip、partial success、多 endpoint；syslog RFC 5424 STRUCTURED-DATA、UDP 分片
 - P2 配置 FFI 化：server/TLS/revocation 尚未迁入 `httpd_config_t`（当前只有 log 三通道）
 - P2 reload：listen 增删、log 通道 enabled/access/error 开关变化、app.lua 重载（路由与 Lua 文件关联待设计）
-- 多 worker 未覆盖：TLS 材料共享（当前仍每 worker 构建）、连接分布方差、绑核/eBPF 分流、workers>1 的吊销表专项（单 worker 05 已覆盖共享实现）
+- 多 worker 未覆盖：连接在 worker 间分布的方差、绑核/eBPF 分流、workers>1 的吊销表专项（单 worker 05 已覆盖共享实现）；共享证书材料的并发正确性由 19 覆盖
 - 性能回归（压测数据在 `bench/results*/`，不在本套件中断言 QPS）
 
 ## 与 bench/tests 的关系
