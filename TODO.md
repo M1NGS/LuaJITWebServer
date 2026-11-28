@@ -192,12 +192,12 @@ P2：`kind="static"/"proxy"`、参数/正则路由、routes 热重载。
 
 ### 恢复基线
 
-- 分支 `main`，最新提交 `0df6c72`（LuaJITWebServer，已推送），工作树应保持干净。
-- 构建：`bash bench/build.sh c-httpd`；全量：`python3 -I tests/run_all.py`（当前 23/23）。
+- 分支 `main`，最新提交 `58a78ac`（LuaJITWebServer，已推送），工作树应保持干净。
+- 构建：`bash bench/build.sh c-httpd`；全量：`python3 -I tests/run_all.py`（当前 24/24）。
 - 关键现状：单进程多 worker（`server.workers`）、per-worker loop/VM/listener、control loop、
   per-worker ring + 单 collector + file writer、吊销表共享、workers>1 SIGHUP reload、
   TLS 证书链/CA 共享 + per-worker 私钥/conf/DRBG、C 层 multipart 流式上传、
-  启动时编译的 routes 表已完成；mbedTLS 以 threading 支持构建。
+  启动时编译的 routes 表、tls.ciphers/ciphersuites 已完成；mbedTLS 以 threading 支持构建。
 - 用户明确要求：**不要主动压测**（2026-11-27 起），除非重新授权；`bench/results*` 仅历史参考。
 
 ### 高优先级
