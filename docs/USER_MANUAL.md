@@ -82,7 +82,9 @@ LD_LIBRARY_PATH=prefix/luajit/lib \
 **按 worker 隔离**，不跨 worker 共享。当前 P0 限制：
 
 - 端口 `0` 只允许 `workers = 1`（每个 worker 会拿到不同端口）；
-- `SIGHUP` reload 直接被拒绝（打印 `not supported with workers > 1`），需重启进程；
+- `SIGHUP` 支持 reload：control 先校验 listen/app/TLS 证书/日志开关，再广播给所有 worker
+  重载 config/app/TLS，失败保留旧配置并记录 error；listen 列表、workers 数量、日志通道
+  `enabled/access/error` 开关变化仍会被拒绝（提示 `requires restart`）；
 - 日志三通道和内置 rotate 已支持：所有 worker 写 per-worker ring，由单 collector 分发，
   file 由单 writer 写盘/rotate；
 - 吊销表是进程级共享表（只加载/刷新一次，所有 worker 只读）；
@@ -662,8 +664,11 @@ kill -HUP $(pidof luajit-httpd)
 - P1 reload 支持：TLS、日志路径/参数、buffers/limits/tcp、revocation、配置级 `log.level`。
   以下变化会拒绝 reload 并提示 `requires restart`：listen 列表、log 通道
   `enabled/access/error` 开关、app.lua 重载（路由与 Lua 文件关联尚未设计）。
-- `server.workers > 1` 时 SIGHUP 直接拒绝（`reload: not supported with workers > 1`），
-  服务继续；需要改配置请重启进程。
+- workers>1 时同样支持 SIGHUP：control 用临时 VM 校验新配置（listen 对比启动快照、
+  app 语法、TLS 证书实际加载、日志开关），通过后发布全局标量并广播 worker。每个 worker
+  在自己的 loop 里重新执行 config.lua、替换 app_ref、重建 TLS 证书代并重起检测定时器；
+  file writer 切换日志路径。校验失败保留旧配置；worker 应用失败保留该 worker 旧 app/TLS
+  并记录 error。
 - 旧连接继续用旧 TLS 代/旧 handler；全局 `config` 在 reload 后指向新表（旧请求若在 reload
   后读全局 config 会看到新值，单 VM 的固有限制）。
 
@@ -745,8 +750,9 @@ BENCH_REPEAT=3 bash bench/run.sh c-httpd
 - 吊销表只影响新握手；不断开已建立连接；会话恢复不重新校验证书。
 - 响应头格式、access/error 日志格式固定，不可配置。
 - reload 不支持 listen 变化和 log 通道开关变化（会拒绝并保留旧配置）；app.lua 暂不随 reload 重载。
-- 多 worker（`server.workers > 1`）P0 限制：不支持 SIGHUP reload；端口 0 不允许；
-  Lua 全局状态按 worker 隔离；`max_connections` 按 worker 计算。日志三通道/rotate 已支持。
+- 多 worker（`server.workers > 1`）：支持 SIGHUP reload（listen/workers 数量/日志通道开关
+  变化需 restart）；端口 0 不允许；Lua 全局状态按 worker 隔离；`max_connections` 按 worker 计算。
+  日志三通道/rotate 已支持；TLS 证书材料仍按 worker 各构建一份。
 - `--check` 不执行 app.lua（只检查文件存在）；app 内容在启动/reload 时校验。
 - OTLP/syslog 外发是 best-effort：队列超限丢最旧、syslog 发送失败丢弃，不保证 at-least-once。
 - OTLP 暂未启用 gzip 压缩（P2）；syslog 的 RFC 5424 STRUCTURED-DATA 暂未填充（P2）。

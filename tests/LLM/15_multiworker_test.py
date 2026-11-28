@@ -78,10 +78,10 @@ def main():
             r.case("4 workers: thread count >= 5", tids >= 5, f"threads={tids}")
 
             srv.proc.send_signal(signal.SIGHUP)
-            time.sleep(0.3)
+            time.sleep(0.5)
             st2, _, _ = http_request(port, "/")
-            r.case("SIGHUP rejected while workers > 1", st2 == 200, f"status={st2}")
-            r.case("SIGHUP rejection logged", "not supported with workers" in srv.log(),
+            r.case("SIGHUP triggers reload while serving", st2 == 200, f"status={st2}")
+            r.case("SIGHUP reload dispatched", "reload: dispatched" in srv.log(),
                    srv.log()[-100:])
 
             srv.proc.send_signal(signal.SIGTERM)

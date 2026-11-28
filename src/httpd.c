@@ -116,9 +116,10 @@ static __thread size_t g_active_connections = 0;
 static size_t g_worker_count = 1;
 typedef struct worker_s {
   uv_loop_t loop;
-  uv_async_t ctrl;        /* control -> worker（停止/强制停止） */
+  uv_async_t ctrl;        /* control -> worker（停止/强制停止/reload） */
   uv_thread_t thread;
   int id;
+  unsigned reload_seen;
 } worker_t;
 static worker_t *g_workers;
 static uv_mutex_t g_cfg_init_mutex;   /* 串行化 worker 配置写入（只在启动阶段） */
@@ -126,7 +127,9 @@ static uv_barrier_t g_init_barrier;
 static uv_loop_t g_ctrl_loop;
 static uv_async_t g_ctrl_done_async;  /* worker -> control（worker 已退出） */
 static volatile int g_ctrl_force;
+static volatile int g_ctrl_shutdown;
 static volatile int g_ctrl_signal_state;
+static unsigned g_ctrl_reload_seq;
 static size_t g_workers_done;
 static __thread int g_current_worker_id = -1;
 
@@ -139,6 +142,42 @@ typedef struct listener_s {
 
 static __thread listener_t *g_listeners;
 static __thread size_t g_listener_count;
+
+/* 启动时的 listen 快照（多 worker reload 只允许 listen 不变） */
+typedef struct {
+  char host[128];
+  int port;
+  int tls;
+} listen_spec_t;
+static listen_spec_t *g_listen_specs;
+static size_t g_listen_spec_count;
+
+static void listen_snapshot_capture(void)
+{
+  free(g_listen_specs);
+  g_listen_spec_count = g_listener_count;
+  g_listen_specs = NULL;
+  if (g_listener_count == 0) return;
+  g_listen_specs = (listen_spec_t *)calloc(g_listener_count, sizeof(listen_spec_t));
+  if (!g_listen_specs) { g_listen_spec_count = 0; return; }
+  for (size_t i = 0; i < g_listener_count; i++) {
+    snprintf(g_listen_specs[i].host, sizeof(g_listen_specs[i].host), "%s",
+             g_listeners[i].host);
+    g_listen_specs[i].port = g_listeners[i].port;
+    g_listen_specs[i].tls = g_listeners[i].tls;
+  }
+}
+
+static int listen_snapshot_matches(void)
+{
+  if (g_listen_spec_count != g_listener_count) return 0;
+  for (size_t i = 0; i < g_listen_spec_count; i++) {
+    if (strcmp(g_listen_specs[i].host, g_listeners[i].host) != 0 ||
+        g_listen_specs[i].port != g_listeners[i].port ||
+        g_listen_specs[i].tls != g_listeners[i].tls) return 0;
+  }
+  return 1;
+}
 
 /* ---------- TCP 选项（config.lua server.tcp） ---------- */
 typedef struct tcp_opts_s {
@@ -317,6 +356,8 @@ static const httpd_config_t k_config_defaults = {
 };
 
 static httpd_config_t g_config;
+/* worker reload 时让 FFI 库写到线程局部副本，避免与 control 发布/其它 worker 争全局 */
+static __thread httpd_config_t *t_config;
 static char g_config_path[512];
 static size_t g_env_max_body;      /* HTTPD_MAX_BODY 覆盖值（reload 时重新应用） */
 static int g_cli_port;             /* 命令行端口（旧兼容模式） */
@@ -327,7 +368,7 @@ static int g_cli_port;             /* 命令行端口（旧兼容模式） */
 #define g_log_syslog  g_config.log.syslog
 #define g_log_level   g_config.log.level
 
-static void *httpd_config_root(void) { return &g_config; }
+static void *httpd_config_root(void) { return t_config ? (void *)t_config : (void *)&g_config; }
 
 static int l_httpd_config_root(lua_State *L)
 {
@@ -1194,6 +1235,7 @@ typedef struct {
   log_file_msg_t *head, *tail;
   size_t bytes, max_bytes;
   int stop, started;
+  int reload;              /* control 请求切换路径/参数 */
   uv_thread_t thread;
   unsigned long dropped;
   char access_path[512], error_path[512];
@@ -1335,6 +1377,22 @@ static void log_file_enqueue(uint16_t type, const char *line, size_t len)
   uv_mutex_unlock(&g_file_writer.mu);
 }
 
+static void log_file_apply_config(void)
+{
+  snprintf(g_file_writer.access_path, sizeof(g_file_writer.access_path), "%s",
+           g_log_file.access_path);
+  snprintf(g_file_writer.error_path, sizeof(g_file_writer.error_path), "%s",
+           g_log_file.error_path);
+  g_file_writer.access_on = g_log_file.access_on && g_file_writer.access_path[0];
+  g_file_writer.error_on = g_log_file.error_on && g_file_writer.error_path[0];
+  g_file_writer.max_bytes = g_log_file.max_bytes ? g_log_file.max_bytes : 4 * 1024 * 1024;
+  g_file_writer.rotate_keep = g_log_file.rotate_keep;
+  g_file_writer.rotate_ms = g_log_file.rotate_ms;
+  g_file_writer.rotate_size = g_log_file.rotate_size;
+  g_file_writer.last_rotate_ns = uv_hrtime();
+  g_file_writer.bytes_since[0] = g_file_writer.bytes_since[1] = 0;
+}
+
 static void log_file_writer_main(void *arg)
 {
   (void)arg;
@@ -1343,15 +1401,17 @@ static void log_file_writer_main(void *arg)
 
   for (;;) {
     uv_mutex_lock(&g_file_writer.mu);
-    while (!g_file_writer.head && !g_file_writer.stop) {
+    while (!g_file_writer.head && !g_file_writer.stop && !g_file_writer.reload) {
       /* 100ms 到点也跳出等待，让空闲缓冲落盘（rotate 也按这个节奏检查） */
       uv_cond_timedwait(&g_file_writer.cond, &g_file_writer.mu, 100ULL * 1000000ULL);
-      if (!g_file_writer.head) break;
+      if (!g_file_writer.head && !g_file_writer.reload) break;
     }
     log_file_msg_t *list = g_file_writer.head;
     g_file_writer.head = g_file_writer.tail = NULL;
     g_file_writer.bytes = 0;
     int stop = g_file_writer.stop;
+    int reload = g_file_writer.reload;
+    if (reload) g_file_writer.reload = 0;
     uv_mutex_unlock(&g_file_writer.mu);
 
     log_file_msg_t *m = list;
@@ -1367,10 +1427,11 @@ static void log_file_writer_main(void *arg)
     for (int i = 0; i < 2; i++) {
       if (bufs[i].len >= 64 * 1024) log_file_flush_buf(i, &bufs[i]);
     }
-    if (!list) {
+    if (!list || reload) {
       for (int i = 0; i < 2; i++) log_file_flush_buf(i, &bufs[i]);
       log_file_time_rotate();
     }
+    if (reload) log_file_apply_config();  /* 旧数据已写回旧路径，再切新配置 */
     if (stop) break;
   }
 
@@ -1384,17 +1445,7 @@ static int log_file_writer_start(void)
 {
   memset(&g_file_writer, 0, sizeof(g_file_writer));
   if (!g_log_file.enabled) return 0;
-  snprintf(g_file_writer.access_path, sizeof(g_file_writer.access_path), "%s",
-           g_log_file.access_path);
-  snprintf(g_file_writer.error_path, sizeof(g_file_writer.error_path), "%s",
-           g_log_file.error_path);
-  g_file_writer.access_on = g_log_file.access_on && g_file_writer.access_path[0];
-  g_file_writer.error_on = g_log_file.error_on && g_file_writer.error_path[0];
-  g_file_writer.max_bytes = g_log_file.max_bytes ? g_log_file.max_bytes : 4 * 1024 * 1024;
-  g_file_writer.rotate_keep = g_log_file.rotate_keep;
-  g_file_writer.rotate_ms = g_log_file.rotate_ms;
-  g_file_writer.rotate_size = g_log_file.rotate_size;
-  g_file_writer.last_rotate_ns = uv_hrtime();
+  log_file_apply_config();
   if (uv_mutex_init(&g_file_writer.mu) != 0) return -1;
   if (uv_cond_init(&g_file_writer.cond) != 0) {
     uv_mutex_destroy(&g_file_writer.mu);
@@ -1408,6 +1459,15 @@ static int log_file_writer_start(void)
     return -1;
   }
   return 0;
+}
+
+static void log_file_writer_reconfigure(void)
+{
+  if (!g_file_writer.started) return;
+  uv_mutex_lock(&g_file_writer.mu);
+  g_file_writer.reload = 1;
+  uv_cond_signal(&g_file_writer.cond);
+  uv_mutex_unlock(&g_file_writer.mu);
 }
 
 static void log_file_writer_stop(void)
@@ -6519,11 +6579,128 @@ static int detect_workers(const char *path)
   return workers;
 }
 
+/* worker 侧应用 reload：只动本 VM 的全局 config/app/TLS 代；全局标量由 control 发布 */
+static int worker_reload_apply(worker_t *w)
+{
+  lua_State *l = L;
+  int base = lua_gettop(l);
+  int cfg = 0;
+  int new_app = LUA_NOREF;
+  tls_gen_t *ng = NULL;
+  int ok = 0;
+
+  httpd_config_t tmp;
+  memcpy(&tmp, &g_config, sizeof(tmp));
+  t_config = &tmp;
+
+  if (luaL_dofile(l, g_config_path) != 0) goto done;
+  if (lua_gettop(l) > base && lua_istable(l, -1)) {
+    cfg = lua_gettop(l);
+  } else {
+    if (lua_gettop(l) > base) lua_pop(l, lua_gettop(l) - base);
+    lua_getglobal(l, "config");
+    if (!lua_istable(l, -1)) goto done;
+    cfg = lua_gettop(l);
+  }
+
+  /* 配置库写线程局部副本，校验失败不影响全局 */
+  lua_getglobal(l, "httpd_config");
+  if (lua_istable(l, -1)) {
+    lua_getfield(l, -1, "load");
+    if (lua_isfunction(l, -1)) {
+      lua_pushvalue(l, cfg);
+      if (lua_pcall(l, 1, 0, 0) != 0) { lua_pop(l, 1); goto done; }
+      lua_pop(l, 1);
+    } else {
+      lua_pop(l, 2);
+    }
+  } else {
+    lua_pop(l, 1);
+  }
+
+  /* 新 app：路径或配置表里的 handle 函数 */
+  lua_getfield(l, cfg, "app");
+  if (lua_isstring(l, -1)) {
+    const char *app_path = lua_tostring(l, -1);
+    lua_pop(l, 1);
+    if (luaL_dofile(l, app_path) != 0) goto done;
+    if (!lua_istable(l, -1)) goto done;
+    lua_getfield(l, -1, "handle");
+    if (!lua_isfunction(l, -1)) goto done;
+    new_app = luaL_ref(l, LUA_REGISTRYINDEX);
+  } else {
+    lua_pop(l, 1);
+    lua_getfield(l, cfg, "handle");
+    if (!lua_isfunction(l, -1)) goto done;
+    new_app = luaL_ref(l, LUA_REGISTRYINDEX);
+  }
+
+  /* TLS 代：用 control 已发布的全局路径/SNI 配置重建 */
+  if (g_tls_enabled) {
+    ng = tls_gen_build(0);
+    if (!ng) goto done;
+  }
+
+  /* 全部成功后再切换 */
+  if (ng) {
+    tls_gen_ref(ng);
+    tls_gen_t *old = g_tls_gen;
+    g_tls_gen = ng;
+    if (old) tls_gen_unref(old);
+  }
+  {
+    int old_app = app_ref;
+    app_ref = new_app;
+    new_app = LUA_NOREF;
+    if (old_app != LUA_NOREF) luaL_unref(l, LUA_REGISTRYINDEX, old_app);
+  }
+  lua_pushvalue(l, cfg);
+  lua_setglobal(l, "config");
+  ok = 1;
+
+done:
+  if (new_app != LUA_NOREF) luaL_unref(l, LUA_REGISTRYINDEX, new_app);
+  lua_settop(l, base);
+  t_config = NULL;
+
+  if (!ok) {
+    log_error(LOG_ERROR, "reload: worker %d failed to apply", w->id);
+    return -1;
+  }
+
+  /* TLS 检测/吊销表定时器按新 interval 重新起（各自 worker loop） */
+  uv_timer_stop(&g_tls_check_timer);
+  if (g_tls_enabled && g_tls_check_interval_ms > 0) {
+    uv_timer_start(&g_tls_check_timer, tls_check_timer_cb,
+                   (uint64_t)g_tls_check_interval_ms,
+                   (uint64_t)g_tls_check_interval_ms);
+  }
+  if (w->id == 0) {
+    uv_timer_stop(&g_revocation_timer);
+    if (g_revocation.enabled && g_revocation.interval_ms > 0) {
+      uv_timer_start(&g_revocation_timer, revocation_timer_cb,
+                     (uint64_t)g_revocation.interval_ms,
+                     (uint64_t)g_revocation.interval_ms);
+    }
+    if (g_revocation.enabled) revocation_timer_cb(&g_revocation_timer);
+  }
+  log_error(LOG_INFO, "reload: worker %d applied", w->id);
+  return 0;
+}
+
 static void worker_ctrl_cb(uv_async_t *h)
 {
-  (void)h;
-  if (g_ctrl_force) force_shutdown();
-  else begin_graceful_shutdown();
+  worker_t *w = (worker_t *)h->data;
+  if (g_ctrl_shutdown) {
+    if (g_ctrl_force) force_shutdown();
+    else begin_graceful_shutdown();
+    return;
+  }
+  unsigned seq = __atomic_load_n(&g_ctrl_reload_seq, __ATOMIC_ACQUIRE);
+  if (seq != w->reload_seen) {
+    w->reload_seen = seq;
+    worker_reload_apply(w);
+  }
 }
 
 static void worker_thread_main(void *arg)
@@ -6539,9 +6716,10 @@ static void worker_thread_main(void *arg)
     fprintf(stderr, "worker %d: uv_async_init failed\n", w->id);
     exit(1);
   }
+  w->ctrl.data = w;
 
   /* 启动阶段串行化：所有 worker 会写同一份 g_config，但都在 accept 之前完成。
-   * 运行期配置只读；多 worker 暂不支持 SIGHUP reload。 */
+   * 运行期配置只读；reload 由 control 校验后广播，worker 只重载本 VM 的 config/app/TLS。 */
   /* init_lua 会把 path 写回 g_config_path；这里先拷贝，避免自覆盖 */
   char cfg_path[512];
   snprintf(cfg_path, sizeof(cfg_path), "%s", g_config_path);
@@ -6552,9 +6730,11 @@ static void worker_thread_main(void *arg)
   tls_snapshot_init();
   revocation_init();
   create_listeners();          /* 只 bind，不 listen */
-  /* 最后一个完成配置的 worker 启动全局日志管道（file writer + collector + 发送线程） */
-  if (__atomic_add_fetch(&g_log_init_done, 1, __ATOMIC_ACQ_REL) == g_worker_count)
+  /* 最后一个完成配置的 worker 记录 listen 快照并启动全局日志管道 */
+  if (__atomic_add_fetch(&g_log_init_done, 1, __ATOMIC_ACQ_REL) == g_worker_count) {
+    listen_snapshot_capture();
     log_pipeline_start();
+  }
   uv_mutex_unlock(&g_cfg_init_mutex);
 
   /* 所有 worker 配置/证书/日志就绪后，同时开始 accept */
@@ -6618,13 +6798,143 @@ static void on_worker_done(uv_async_t *h)
     uv_stop(&g_ctrl_loop);
 }
 
+/* control 侧多 worker reload：校验 listen/log 开关/app，发布全局标量，worker 各自应用 */
+static int multi_reload_config(void)
+{
+  if (g_reloading) {
+    fprintf(stderr, "reload: already in progress\n");
+    return -1;
+  }
+  g_reloading = 1;
+  g_cfg_err[0] = 0;
+
+  lua_State *saved_L = L;
+  lua_State *t = luaL_newstate();
+  if (!t) { g_reloading = 0; return -1; }
+  luaL_openlibs(t);
+  lua_register(t, "__httpd_config_root", l_httpd_config_root);
+  lua_register(t, "__httpd_config_abi", l_httpd_config_abi);
+  inject_bytecode(t, luaJIT_BC_config_cdef, luaJIT_BC_config_cdef_len,
+                  "=config_cdef", "__httpd_config_cdef");
+  inject_bytecode(t, luaJIT_BC_httpd_config, luaJIT_BC_httpd_config_len,
+                  "=httpd_config", "httpd_config");
+  lua_pushnil(t);
+  lua_setglobal(t, "__httpd_config_cdef");
+  L = t;
+
+  reload_backup_t b;
+  reload_save(&b);
+  int base = lua_gettop(L);
+  config_reset_for_reload();
+
+  jmp_buf jb;
+  int ok = 0;
+  g_cfg_jmp = &jb;
+  if (setjmp(jb) == 0) {
+    if (reload_load_config() == 0) ok = 1;
+  } else {
+    ok = 0;
+  }
+  g_cfg_jmp = NULL;
+
+  if (ok && !listen_snapshot_matches()) {
+    snprintf(g_cfg_err, sizeof(g_cfg_err), "listen changes require restart");
+    ok = 0;
+  }
+
+  if (ok) {
+    const httpd_log_cfg_t *oldc = &b.config.log;
+    const httpd_log_cfg_t *newc = &g_config.log;
+    if (oldc->file.enabled != newc->file.enabled ||
+        oldc->file.access_on != newc->file.access_on ||
+        oldc->file.error_on != newc->file.error_on ||
+        oldc->otlp.enabled != newc->otlp.enabled ||
+        oldc->syslog.enabled != newc->syslog.enabled) {
+      snprintf(g_cfg_err, sizeof(g_cfg_err),
+               "log channel enable/disable requires restart");
+      ok = 0;
+    }
+  }
+
+  /* app 只做语法/存在性检查，不执行（真正加载在 worker 应用阶段） */
+  if (ok) {
+    lua_getglobal(L, "config");
+    if (!lua_istable(L, -1)) {
+      snprintf(g_cfg_err, sizeof(g_cfg_err), "config table missing");
+      ok = 0;
+    } else {
+      lua_getfield(L, -1, "app");
+      if (lua_isstring(L, -1)) {
+        const char *app_path = lua_tostring(L, -1);
+        if (access(app_path, R_OK) != 0) {
+          snprintf(g_cfg_err, sizeof(g_cfg_err),
+                   "app file not readable: %s", app_path);
+          ok = 0;
+        } else if (luaL_loadfile(L, app_path) != 0) {
+          snprintf(g_cfg_err, sizeof(g_cfg_err), "app load: %s",
+                   lua_tostring(L, -1));
+          ok = 0;
+        } else {
+          lua_pop(L, 1);
+        }
+      } else {
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "handle");
+        if (!lua_isfunction(L, -1)) {
+          snprintf(g_cfg_err, sizeof(g_cfg_err), "app handle missing");
+          ok = 0;
+        }
+        lua_pop(L, 1);
+      }
+      lua_pop(L, 1);
+    }
+  }
+
+  if (!ok) {
+    if (g_listeners && g_listeners != b.listeners) free(g_listeners);
+    if (g_tls_gen && g_tls_gen != b.tls_gen) tls_gen_unref(g_tls_gen);
+    lua_settop(L, base);
+    reload_restore(&b);
+    log_error(LOG_ERROR, "reload failed: %s",
+              g_cfg_err[0] ? g_cfg_err : "unknown error");
+    L = saved_L;
+    lua_close(t);
+    g_reloading = 0;
+    return -1;
+  }
+
+  /* 成功：control 侧只用于校验的 listeners/TLS 代释放掉，worker 各自持自己的 */
+  free(g_listeners);
+  g_listeners = NULL;
+  g_listener_count = 0;
+  if (g_tls_gen) { tls_gen_unref(g_tls_gen); g_tls_gen = NULL; }
+  if (b.tls_gen) tls_gen_unref(b.tls_gen);
+  lua_settop(L, base);
+  if (b.config_ref != LUA_NOREF && b.config_ref != LUA_REFNIL) {
+    luaL_unref(L, LUA_REGISTRYINDEX, b.config_ref);
+  }
+  if (g_env_max_body) max_body_stream = g_env_max_body;
+
+  L = saved_L;
+  lua_close(t);
+  g_reloading = 0;
+  return 0;
+}
+
 static void on_ctrl_signal(uv_signal_t *h, int signum)
 {
   (void)h;
   if (signum == SIGHUP) {
-    fprintf(stderr, "reload: not supported with workers > 1 (ignored)\n");
+    if (g_ctrl_shutdown) return;
+    if (multi_reload_config() == 0) {
+      log_file_writer_reconfigure();
+      __atomic_add_fetch(&g_ctrl_reload_seq, 1, __ATOMIC_ACQ_REL);
+      for (size_t i = 0; i < g_worker_count; i++) uv_async_send(&g_workers[i].ctrl);
+      fprintf(stderr, "reload: dispatched to %zu worker(s)\n", g_worker_count);
+    }
     return;
   }
+  g_ctrl_shutdown = 1;
   if (g_ctrl_signal_state == 0) {
     g_ctrl_signal_state = 1;
     fprintf(stderr, "shutdown: draining %zu worker(s)\n", g_worker_count);
@@ -6639,7 +6949,10 @@ static int run_multi_worker(void)
 {
   g_workers_done = 0;
   g_ctrl_force = 0;
+  g_ctrl_shutdown = 0;
   g_ctrl_signal_state = 0;
+  g_ctrl_reload_seq = 0;
+  g_reloading = 0;
 
   if (uv_mutex_init(&g_cfg_init_mutex) != 0) return -1;
   if (uv_barrier_init(&g_init_barrier, (unsigned)g_worker_count) != 0) {
@@ -6756,6 +7069,7 @@ int main(int argc, char **argv)
 
   config_defaults_init();
   init_lua(cfg, cli_port, check_mode);
+  if (!check_mode) listen_snapshot_capture();
   if (g_env_max_body) max_body_stream = g_env_max_body;
 
   if (check_mode) {

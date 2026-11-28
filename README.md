@@ -63,4 +63,5 @@ curl -i http://127.0.0.1:8080/
 
 HTTP/1.1 only；`routes` 配置和 C 层 multipart 上传尚未实现；
 SNI 不支持 IDN/多级通配；`tls.ciphers` 暂未应用。多 worker（`server.workers > 1`）为 P0：
-暂不支持 SIGHUP reload；TLS 证书材料仍按 worker 各构建一份。完整列表见用户手册第 12 节。
+listen/workers 数量/日志通道开关变化需 restart；TLS 证书材料仍按 worker 各构建一份。
+完整列表见用户手册第 12 节。

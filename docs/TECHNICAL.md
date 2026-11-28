@@ -384,11 +384,20 @@ libuv 没有内建优雅退出；`uv_stop` 只停止 loop。实现为应用层�
   不再每 worker 各加载/各起刷新 timer。
 - TLS：每 worker 基于全局路径各自构建 `tls_gen`（mbedTLS config/DRBG 不能跨线程共享），
   证书检测 timer 也每 worker 各跑一份；material/worker-cfg 拆分是下一步。
-- reload：workers>1 时 SIGHUP 直接拒绝并打印；需要改配置必须重启。
-- 限制：单进程内一个 worker 段错误仍会带走整个进程；SO_REUSEPORT 的已有连接不能迁移；
+- reload（P1 已完成）：control loop 收到 SIGHUP 后，用临时 Lua VM + 注入字节码校验新配置：
+  listen 表与启动快照逐项对比、app 只做 `luaL_loadfile` 语法检查、TLS 实际构建证书代、
+  log 通道 enable/access 开关对比；通过后发布全局 `g_config/g_tcp/buffers/limits/TLS 路径`
+  并释放 control 侧临时 listeners/TLS 代。随后递增 reload seq 并 `uv_async` 广播所有 worker：
+  worker 在自己的 loop 里重新执行 config.lua（FFI 库写线程局部 `t_config`，不碰全局）、
+  替换 `app_ref`、按新全局路径重建本 worker 的 TLS 代、重起 TLS 检测/吊销表定时器；
+  control 同时让 file writer 切日志路径。失败时 control 用 backup 恢复旧全局配置并记录
+  `reload failed`；worker 应用失败保留该 worker 旧 app/TLS。
+- 限制：listen 列表、workers 数量、log 通道 `enabled/access/error` 开关变化仍拒绝
+  （`requires restart`）；应用阶段不是全局事务（某 worker 失败只影响该 worker）。
+- 单进程内一个 worker 段错误仍会带走整个进程；SO_REUSEPORT 的已有连接不能迁移；
   `max_connections` 按 worker 计算；尚无 eBPF 分流/绑核。
-- 后续（P1/P2）：TLS 材料共享（证书/私钥/CA 解析一次 + per-worker conf/DRBG）、workers>1
-  的 reload、每 worker 统计与连接配额、绑核/jemalloc 调参、`lua_shared_dict`。
+- 后续（P1/P2）：TLS 材料共享（证书/私钥/CA 解析一次 + per-worker conf/DRBG）、每 worker
+  统计与连接配额、绑核/jemalloc 调参、`lua_shared_dict`。
 
 ## 13. 配置模型
 

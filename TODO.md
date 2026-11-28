@@ -110,7 +110,7 @@ handler 仍由 Lua 执行；`kind="upload"` 与 C 层 multipart 上传联动。
 - `tests/LLM/`：HTTP/流式、TLS、SNI、mTLS、吊销表、日志格式、rotate、三通道外发、健壮性、配置校验、旧模式/TCP、Lua API
 - `tests/HUMAN/`：人工确认的 body 三态语义、优雅退出契约
 - 每个脚本独立起停服务、临时证书/配置、统一 `TEST/CASE/RESULT` 输出
-- `python3 -I tests/run_all.py`，当前 19/19 套件通过；详见 `tests/README.md`
+- `python3 -I tests/run_all.py`，当前 20/20 套件通过；详见 `tests/README.md`
 
 ## 8. 配置 FFI 化（P1 已完成 2026-11-28，P2 待做）
 
@@ -146,12 +146,14 @@ handler 仍由 Lua 执行；`kind="upload"` 与 C 层 multipart 上传联动。
   证书路径只读。
 - P0 限制：SIGHUP reload 拒绝；OTLP/syslog 和内置日志 rotate 在多 worker 下禁用；端口 0
   只允许 workers=1；`max_connections` 按 worker 计算；无连接迁移。
-- 测试：`tests/LLM/15_multiworker_test.py`（10 用例），全量 19 套件通过。
+- 测试：`tests/LLM/15_multiworker_test.py`（10 用例），全量 20 套件通过。
 - P1 已完成（2026-11-28）：per-worker SPSC ring（access 1 MiB / error 64 KiB）+ 单 collector
   按 targets 位图分发；file writer 单写者写盘/rotate；OTLP/syslog 发送线程从 collector 入队；
   关闭顺序 worker→collector→file→发送线程；多 worker 三通道和内置 rotate 已启用。
   吊销表改为进程级共享（原子指针 + 引用计数 + retire 队列），只加载/刷新一次。
 - P1 待做：TLS 材料共享（证书/私钥/CA 解析一次 + per-worker conf/DRBG + 原子发布）、
-  workers>1 的 SIGHUP reload、每 worker 统计与连接配额、连接分布监控。
+  每 worker 统计与连接配额、连接分布监控。
 - P2：`SO_ATTACH_REUSEPORT_EBPF` 按 CPU 分流（已评估，复杂度/不确定性高，暂不做）、
   绑核、jemalloc 调参、`lua_shared_dict`（业务跨 worker KV，尚未设计）。
+- P1 已完成（2026-11-28）：多 worker SIGHUP reload（control 校验 + 广播；listen/workers 数量/
+  日志通道开关变化拒绝）；测试 `tests/LLM/18_multiworker_reload_test.py`。

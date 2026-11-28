@@ -8,8 +8,8 @@ return {
   server = {
     -- 1 = 单线程（默认）；N = N 个 worker 线程，每 worker 独立 libuv loop + LuaJIT VM，
     -- 各自 bind 同一端口（SO_REUSEPORT）；"auto" = CPU 数。
-    -- 多 worker P0 限制：不支持 SIGHUP reload；端口 0 只允许 workers = 1；
-    -- 日志三通道（file/OTLP/syslog）和内置 rotate 均已支持（单 collector + 单 writer）。
+    -- 多 worker 限制：listen/workers 数量/日志通道开关变化需 restart（其余配置可 SIGHUP 重载）；
+    -- 端口 0 只允许 workers = 1；日志三通道/rotate 已支持（单 collector + 单 writer）。
     workers = 1,
 
     listen = {

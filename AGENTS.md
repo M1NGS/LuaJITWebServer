@@ -28,9 +28,13 @@
 - `uv_queue_work` 的 work 回调运行在 libuv 线程池线程，**不能读提交线程的 `__thread` 变量**；
   所需配置/快照必须在提交前复制进 job（2026-11-28 吊销表与 TLS stamps 踩过这个坑）。
 - Lua 状态不可跨线程访问；`luaL_newstate`/`lua_close` 必须在所属 worker 线程。
-- 多 worker P0 限制：SIGHUP reload 拒绝、端口 0 禁止；日志三通道/rotate 由 per-worker
-  ring + 单 collector + 单 file writer 支持。改动日志路径/关闭顺序前先更新
-  `tests/LLM/15_multiworker_test.py` / `16_log_pipeline_test.py` 和用户手册。
+- 多 worker 支持 SIGHUP reload：control 用临时 Lua VM 校验并发布全局标量，worker 只重载
+  本 VM 的 config/app/TLS；FFI 库在 worker reload 时写线程局部 `t_config`，禁止写全局
+  `g_config`。listen/workers 数量/日志通道 enable 开关变化仍拒绝。
+  改动 reload 路径前先更新 `tests/LLM/15_multiworker_test.py` / `18_multiworker_reload_test.py`
+  和用户手册。
+- 日志三通道/rotate 由 per-worker ring + 单 collector + 单 file writer 支持。
+  改动日志路径/关闭顺序前先更新 `tests/LLM/16_log_pipeline_test.py` 和用户手册。
 - 日志热路径只允许写 per-worker ring（无锁、无系统调用）；file/OTLP/syslog 的编码、写盘、
   网络全部在各自线程。`uv_queue_work` 的 work 回调不能读提交线程的 `__thread` 变量。
 - 吊销表是进程级共享表（`g_revoked` 原子指针 + 引用计数）；验证回调必须 load+ref/unref，
