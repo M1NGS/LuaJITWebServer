@@ -207,6 +207,31 @@ static const tcp_opts_t k_tcp_defaults = { 1, 0, 60, 10, 5, 0, 1024, 0, 0, 0 };
 
 static tcp_opts_t g_tcp;
 
+/* ---------- routes：启动时编译为每 worker 只读表（SIGHUP 不重载） ---------- */
+#define MAX_ROUTES 64
+typedef enum {
+  ROUTE_KIND_LUA = 0,     /* 普通 Lua handler */
+  ROUTE_KIND_UPLOAD = 1,  /* 要求 multipart/form-data，否则 415 */
+} route_kind_t;
+
+typedef struct route_def_s {
+  char path[256];
+  size_t path_len;
+  char method[16];        /* 大写；空 = 任意方法 */
+  size_t method_len;
+  int prefix;             /* 1 = 前缀匹配，0 = 精确 */
+  int kind;
+} route_def_t;
+
+static __thread route_def_t g_routes[MAX_ROUTES];
+static __thread size_t g_route_count;
+static __thread int g_route_refs[MAX_ROUTES];   /* registry refs，每 worker 独立 */
+
+/* 启动时第一条 worker 记录的路由定义快照（control 线程 reload 校验用） */
+static route_def_t g_route_snapshot[MAX_ROUTES];
+static size_t g_route_snapshot_count;
+static int g_route_snapshot_valid;
+
 /* ---------- TLS（mbedTLS 3.6）：共享证书材料 + 每 worker 配置代 ---------- */
 
 /* 证书/CA 文件的时间戳快照（定时检测 + 共享材料代匹配） */
@@ -666,6 +691,7 @@ typedef struct request_s {
   int multipart;             /* Content-Type: multipart/form-data */
   char mp_boundary[MP_BOUNDARY_MAX + 2];
   multipart_ctx_t *mp;
+  int route;                 /* 命中的 routes 下标；-1 = 未命中 */
 
   resp_mode_t mode;
   int head_sent;
@@ -744,6 +770,8 @@ static void mp_ctx_free(request_t *r);
 static void mp_publish_req(request_t *r);
 static int mp_feed(conn_t *c, const char *data, size_t len);
 static void mp_complete(conn_t *c);
+static int route_match(const char *path, size_t path_len,
+                       const char *method, size_t method_len);
 
 static const char *STREAM_LIB_LUA =
   "local M = {}\n"
@@ -848,7 +876,9 @@ static const char *reason_phrase(int status)
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 413: return "Payload Too Large";
+    case 415: return "Unsupported Media Type";
     case 431: return "Request Header Fields Too Large";
+    case 507: return "Insufficient Storage";
     case 500: return "Internal Server Error";
     case 502: return "Bad Gateway";
     case 503: return "Service Unavailable";
@@ -3782,7 +3812,12 @@ static void start_handler(conn_t *c)
   r->co = co;
   r->co_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
-  lua_rawgeti(co, LUA_REGISTRYINDEX, app_ref);
+  int ref = app_ref;
+  if (r->route >= 0 && r->route < (int)g_route_count &&
+      g_route_refs[r->route] != LUA_NOREF) {
+    ref = g_route_refs[r->route];
+  }
+  lua_rawgeti(co, LUA_REGISTRYINDEX, ref);
   if (!lua_isfunction(co, -1)) {
     lua_getfield(co, -1, "handle");
     lua_remove(co, -2);
@@ -4721,6 +4756,12 @@ static int try_parse_head(conn_t *c)
     r->auto_buffer = 0;
   }
 
+  r->route = route_match(r->path, r->path_len, r->method, r->method_len);
+  if (r->route >= 0 && g_routes[r->route].kind == ROUTE_KIND_UPLOAD && !r->multipart) {
+    send_error(c, 415, "route requires multipart/form-data");
+    return 0;
+  }
+
   buf_consume(c, head_len);
 
   if (r->multipart) {
@@ -5487,6 +5528,205 @@ static void parse_tls(lua_State *l, int sidx)
     log_error(LOG_WARN, "warning: tls.ciphers/ciphersuites not applied yet (using mbedTLS defaults)");
   }
   lua_pop(l, 1); /* tls */
+}
+
+/* ---------- routes：数组解析、匹配、reload 校验 ---------- */
+
+/* 解析 cfg.routes 到 defs；refs 非 NULL 时同时创建每项的 handler registry ref。
+ * 失败返回 -1（g_cfg_err 有原因），已创建的 refs 会回滚。 */
+static int routes_parse(lua_State *l, int cfg_idx, route_def_t *defs, size_t *out_n,
+                        int *refs)
+{
+  *out_n = 0;
+  lua_getfield(l, cfg_idx, "routes");
+  if (lua_isnil(l, -1)) {
+    lua_pop(l, 1);
+    return 0;
+  }
+  if (!lua_istable(l, -1)) {
+    snprintf(g_cfg_err, sizeof(g_cfg_err), "routes must be an array");
+    lua_pop(l, 1);
+    return -1;
+  }
+  size_t n = (size_t)lua_objlen(l, -1);
+  if (n > MAX_ROUTES) {
+    snprintf(g_cfg_err, sizeof(g_cfg_err), "too many routes (max %d)", MAX_ROUTES);
+    lua_pop(l, 1);
+    return -1;
+  }
+  int created = 0;
+
+  for (size_t i = 0; i < n; i++) {
+    lua_rawgeti(l, -1, (lua_Integer)(i + 1));
+    if (!lua_istable(l, -1)) {
+      snprintf(g_cfg_err, sizeof(g_cfg_err), "routes[%zu] must be a table", i + 1);
+      lua_pop(l, 1);
+      goto fail;
+    }
+    route_def_t *d = &defs[i];
+    memset(d, 0, sizeof(*d));
+
+    lua_getfield(l, -1, "path");
+    if (!lua_isstring(l, -1)) {
+      snprintf(g_cfg_err, sizeof(g_cfg_err),
+               "routes[%zu].path must be a string", i + 1);
+      lua_pop(l, 2);
+      goto fail;
+    }
+    size_t pl = 0;
+    const char *ps = lua_tolstring(l, -1, &pl);
+    if (pl == 0 || pl >= sizeof(d->path) || ps[0] != '/') {
+      snprintf(g_cfg_err, sizeof(g_cfg_err),
+               "routes[%zu].path must start with '/' and be < %zu bytes",
+               i + 1, sizeof(d->path));
+      lua_pop(l, 2);
+      goto fail;
+    }
+    memcpy(d->path, ps, pl);
+    d->path_len = pl;
+    lua_pop(l, 1);
+
+    lua_getfield(l, -1, "method");
+    if (lua_isnil(l, -1)) {
+      d->method_len = 0;
+    } else if (lua_isstring(l, -1)) {
+      size_t ml = 0;
+      const char *ms = lua_tolstring(l, -1, &ml);
+      if (ml == 0 || strcmp(ms, "*") == 0) {
+        d->method_len = 0;
+      } else if (ml >= sizeof(d->method)) {
+        snprintf(g_cfg_err, sizeof(g_cfg_err),
+                 "routes[%zu].method too long", i + 1);
+        lua_pop(l, 2);
+        goto fail;
+      } else {
+        for (size_t j = 0; j < ml; j++)
+          d->method[j] = (char)toupper((unsigned char)ms[j]);
+        d->method_len = ml;
+      }
+    } else {
+      snprintf(g_cfg_err, sizeof(g_cfg_err),
+               "routes[%zu].method must be a string", i + 1);
+      lua_pop(l, 2);
+      goto fail;
+    }
+    lua_pop(l, 1);
+
+    lua_getfield(l, -1, "prefix");
+    d->prefix = lua_isboolean(l, -1) && lua_toboolean(l, -1);
+    lua_pop(l, 1);
+
+    lua_getfield(l, -1, "kind");
+    if (lua_isnil(l, -1)) {
+      d->kind = ROUTE_KIND_LUA;
+    } else if (lua_isstring(l, -1)) {
+      const char *ks = lua_tostring(l, -1);
+      if (strcmp(ks, "lua") == 0) d->kind = ROUTE_KIND_LUA;
+      else if (strcmp(ks, "upload") == 0) d->kind = ROUTE_KIND_UPLOAD;
+      else {
+        snprintf(g_cfg_err, sizeof(g_cfg_err),
+                 "routes[%zu].kind must be 'lua' or 'upload'", i + 1);
+        lua_pop(l, 2);
+        goto fail;
+      }
+    } else {
+      snprintf(g_cfg_err, sizeof(g_cfg_err),
+               "routes[%zu].kind must be a string", i + 1);
+      lua_pop(l, 2);
+      goto fail;
+    }
+    lua_pop(l, 1);
+
+    lua_getfield(l, -1, "handler");
+    if (!lua_isfunction(l, -1)) {
+      snprintf(g_cfg_err, sizeof(g_cfg_err),
+               "routes[%zu].handler must be a function", i + 1);
+      lua_pop(l, 2);
+      goto fail;
+    }
+    if (refs) {
+      refs[i] = luaL_ref(l, LUA_REGISTRYINDEX);
+      created++;
+    } else {
+      lua_pop(l, 1);
+    }
+    lua_pop(l, 1); /* route item */
+  }
+
+  lua_pop(l, 1); /* routes table */
+  *out_n = n;
+  return 0;
+
+fail:
+  lua_pop(l, 1); /* routes table */
+  if (refs) {
+    for (int j = 0; j < created; j++)
+      luaL_unref(l, LUA_REGISTRYINDEX, refs[j]);
+  }
+  return -1;
+}
+
+/* 启动时提交（每 worker 第一次，g_route_count 为 0） */
+static void routes_commit(route_def_t *defs, size_t n, int *refs)
+{
+  for (size_t i = 0; i < g_route_count; i++) {
+    if (g_route_refs[i] != LUA_NOREF)
+      luaL_unref(L, LUA_REGISTRYINDEX, g_route_refs[i]);
+  }
+  memcpy(g_routes, defs, n * sizeof(route_def_t));
+  memcpy(g_route_refs, refs, n * sizeof(int));
+  g_route_count = n;
+}
+
+static int route_match(const char *path, size_t path_len,
+                       const char *method, size_t method_len)
+{
+  for (size_t i = 0; i < g_route_count; i++) {
+    route_def_t *d = &g_routes[i];
+    if (d->method_len > 0) {
+      if (method_len != d->method_len) continue;
+      if (strncasecmp(method, d->method, method_len) != 0) continue;
+    }
+    if (d->prefix) {
+      if (path_len < d->path_len) continue;
+      if (memcmp(path, d->path, d->path_len) != 0) continue;
+    } else {
+      if (path_len != d->path_len) continue;
+      if (memcmp(path, d->path, path_len) != 0) continue;
+    }
+    return (int)i;
+  }
+  return -1;
+}
+
+/* reload 阶段：routes 变化需要 restart；失败用 die()（reload 下 longjmp 回滚） */
+static void routes_validate_reload(lua_State *l)
+{
+  lua_getglobal(l, "config");
+  if (!lua_istable(l, -1)) {
+    lua_pop(l, 1);
+    return;
+  }
+  route_def_t *defs = (route_def_t *)calloc(MAX_ROUTES, sizeof(route_def_t));
+  if (!defs) die("out of memory for routes");
+  size_t n = 0;
+  if (routes_parse(l, lua_gettop(l), defs, &n, NULL) != 0) {
+    free(defs);
+    lua_pop(l, 1);
+    die("%s", g_cfg_err);
+  }
+  int changed = !g_route_snapshot_valid || (n != g_route_snapshot_count);
+  if (!changed) {
+    for (size_t i = 0; i < n; i++) {
+      if (memcmp(&defs[i], &g_route_snapshot[i], sizeof(route_def_t)) != 0) {
+        changed = 1;
+        break;
+      }
+    }
+  }
+  free(defs);
+  lua_pop(l, 1);
+  if (changed) die("routes changes require restart");
 }
 
 static void tls_report(int ret, char *buf, size_t n)
@@ -7038,6 +7278,32 @@ static void init_lua(const char *path, int cli_port, int check_mode)
 
   if (cli_port > 0 && g_listener_count > 0) g_listeners[0].port = cli_port;
 
+  /* routes：启动时编译为每 worker 只读表（reload 只校验不变，不重建） */
+  {
+    route_def_t *defs = (route_def_t *)calloc(MAX_ROUTES, sizeof(route_def_t));
+    int *refs = (int *)malloc(MAX_ROUTES * sizeof(int));
+    if (!defs || !refs) {
+      free(defs);
+      free(refs);
+      die("out of memory for routes");
+    }
+    for (size_t i = 0; i < MAX_ROUTES; i++) refs[i] = LUA_NOREF;
+    size_t n = 0;
+    if (routes_parse(L, cfg, defs, &n, refs) != 0) {
+      free(defs);
+      free(refs);
+      die("%s", g_cfg_err);
+    }
+    routes_commit(defs, n, refs);
+    if (!g_route_snapshot_valid) {
+      memcpy(g_route_snapshot, defs, n * sizeof(route_def_t));
+      g_route_snapshot_count = n;
+      g_route_snapshot_valid = 1;
+    }
+    free(defs);
+    free(refs);
+  }
+
   lua_getfield(L, cfg, "app");
   if (lua_isstring(L, -1)) {
     const char *app_path = lua_tostring(L, -1);
@@ -7405,7 +7671,10 @@ static void reload_config(void)
   int ok = 0;
   g_cfg_jmp = &jb;
   if (setjmp(jb) == 0) {
-    if (reload_load_config() == 0) ok = 1;
+    if (reload_load_config() == 0) {
+      routes_validate_reload(L);
+      ok = 1;
+    }
   } else {
     ok = 0;
   }
@@ -7756,7 +8025,10 @@ static int multi_reload_config(void)
   int ok = 0;
   g_cfg_jmp = &jb;
   if (setjmp(jb) == 0) {
-    if (reload_load_config() == 0) ok = 1;
+    if (reload_load_config() == 0) {
+      routes_validate_reload(L);
+      ok = 1;
+    }
   } else {
     ok = 0;
   }

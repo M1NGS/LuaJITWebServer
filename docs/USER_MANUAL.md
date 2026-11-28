@@ -371,8 +371,44 @@ uploader = { uri = "http://127.0.0.1:9000/upload" }  -- 任意业务字段
 ```
 
 - `config` 全局变量在 Lua 中可用，例如 `config.uploader.uri`。
-- C 不解释 `uploader` 等业务字段；`routes` 配置当前版本尚未实现，路由请写在 `app.lua` 里。
+- C 不解释 `uploader` 等业务字段；路由见 4.10。
 - 如果配置表没有 `server` 且有 `handle`，按旧 app.lua 模式启动。
+
+### 4.10 routes（路由表）
+
+`routes` 是顶层数组，启动时由 C 编译为每 worker 只读表；命中后用对应 handler，
+未命中回退 `app.handle`。handler 是**配置表里的内联函数**（不跨 VM 存储）。
+
+```lua
+routes = {
+  { path = "/api/v1", method = "GET", handler = function(req, res)
+      return { status = 200, body = "api" }
+    end },
+  { path = "/static/", prefix = true, handler = function(req, res)
+      return serve_static(req, res)
+    end },
+  { path = "/upload", method = "POST", kind = "upload",
+    handler = function(req, res)
+      -- 只有 multipart 请求会到这里；req.fields/req.files 已就绪
+      return { status = 200, body = "ok" }
+    end },
+}
+```
+
+| 字段 | 必需 | 说明 |
+|---|---|---|
+| `path` | 是 | 以 `/` 开头、≤255 字节；默认精确匹配（不含 query） |
+| `prefix` | 否 | `true` 时前缀匹配（`/static` 不会命中 `/static/` 规则） |
+| `method` | 否 | 大小写不敏感；省略或 `"*"` = 任意方法 |
+| `kind` | 否 | `"lua"`（默认）或 `"upload"`；`upload` 要求 multipart，否则 415 |
+| `handler` | 是 | Lua 函数（config 表内联） |
+
+- 匹配顺序：数组顺序，第一条命中生效；区分大小写。
+- 未命中 → `app.handle`（app 仍需提供 fallback；否则该请求不会被路由）。
+- 多 worker：每个 worker 启动时编译自己的定义/函数引用，不跨 worker 共享。
+- `SIGHUP` 不重建 routes：修改 `routes` 后 reload 会失败并提示
+  `routes changes require restart`；只改 `app.lua`（fallback）不受影响。
+- `--check` 校验 routes 结构（类型/长度/kind/handler 是函数），不执行 handler。
 
 ## 5. 编写 Lua 业务
 
@@ -795,7 +831,8 @@ BENCH_REPEAT=3 bash bench/run.sh c-httpd
 - 只支持 HTTP/1.1；不支持 HTTP/2。
 - 请求体支持 Content-Length 和 `Transfer-Encoding: chunked`（仅 chunked coding；其他 TE、HTTP/1.0 TE、CL+TE 返回 400）。
 - `multipart/form-data` 由 C 层流式解析（见 5.1.1）：同步写盘；暂无 `filename*`、增量 SHA1、异步落盘。
-- `routes` 配置尚未实现；路由在 `app.lua` 内自己判断。`uploader` 只是透传业务配置。
+- `routes` 只支持精确/前缀 + method + `kind=lua|upload`；`kind=static/proxy`、正则/参数路由
+  尚未实现。routes 变化需 restart（SIGHUP 会拒绝并保留旧路由）。`uploader` 只是透传业务配置。
 - SNI 不支持 IDN Unicode 自动转换和多级通配；配置写 Punycode/精确名。
 - `tls.ciphers` / `ciphersuites` 暂未应用。
 - 吊销表 provider 目前只有 mock 文件；pgsql native 待接。

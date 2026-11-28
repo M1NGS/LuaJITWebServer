@@ -66,6 +66,17 @@
 - multipart 请求在解析完成前不 dispatch handler；`req.body=nil`，`req:read()`/`req:text()`
   被替换为返回 nil 的 C 函数。改动解析/交付路径后跑 `tests/LLM/20_multipart_upload_test.py`。
 
+## routes
+
+- `routes` 只在启动时编译：每 worker 的 `g_routes`/`g_route_refs` 是 `__thread`，
+  handler 是 config.lua 内联函数，存 registry ref。第一个 worker 写入进程级
+  `g_route_snapshot`；control 线程自身没有路由表，reload 校验必须比较快照而不是
+  `g_routes`（2026-11-29 踩坑：多 worker reload 误报 `routes changes require restart`）。
+- SIGHUP 不重建 routes；变化通过 `die("routes changes require restart")` 拒绝并回滚。
+  app 重载（多 worker）只替换 fallback `app_ref`，路由 refs 保持启动时的函数。
+- 未命中回退 `app_ref`（app.handle）；`kind="upload"` 在 `try_parse_head` 检查
+  `req.multipart`，否则 415。改动匹配/解析后跑 `tests/LLM/21_routes_test.py`。
+
 ## 依赖与构建
 
 - 本项目在 WSL 内的工作目录是 `~/workspaces/LuaJITHttpserver`（与项目目录同名），Linux 侧的源码、构建产物和脚本都放在这里。

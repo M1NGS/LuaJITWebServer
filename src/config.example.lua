@@ -125,7 +125,23 @@ return {
     },
   },
 
-  app = "src/app.lua",   -- 业务模块：return { handle = function(req, res) ... end }
+  app = "src/app.lua",   -- 业务模块：return { handle = function(req, res) ... end }（未命中路由时用）
+
+  -- 可选：启动时编译的路由表（改 routes 需 restart；SIGHUP 会拒绝变化）
+  -- 匹配顺序按数组顺序；未命中回退 app.handle
+  -- routes = {
+  --   { path = "/api/v1", method = "GET", handler = function(req, res)
+  --       return { status = 200, body = "api" }
+  --     end },
+  --   { path = "/static/", prefix = true, handler = function(req, res)
+  --       return { status = 404, body = "not implemented" }
+  --     end },
+  --   { path = "/upload", method = "POST", kind = "upload",
+  --     handler = function(req, res)
+  --       -- multipart 已由 C 层解析：req.fields / req.files
+  --       return { status = 200, body = "ok" }
+  --     end },
+  -- },
 
   -- 客户端证书吊销表（自定义数据库 / mock）
   revocation = {

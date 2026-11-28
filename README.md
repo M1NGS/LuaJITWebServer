@@ -9,6 +9,7 @@ mbedTLS 提供 HTTPS。
   `SO_REUSEPORT` 监听同一端口）；每请求一个 Lua 协程
 - 流式请求体/响应体、协程背压；请求体支持 Content-Length、`Transfer-Encoding: chunked`
   与 C 层流式 `multipart/form-data`（`req.fields`/`req.files`、临时文件、软限制）
+- 启动时编译的 `routes` 表（精确/前缀匹配、method 过滤、`kind=upload`），未命中回退 app.handle
 - HTTP/HTTPS 多 listener、keep-alive、pipeline
 - SNI 多证书、per-SNI mTLS（不同域名不同客户端 CA / 是否要求客户端证书）
 - 客户端证书吊销表（SHA-256 指纹，mock/数据库 provider 形态）
@@ -62,8 +63,9 @@ curl -i http://127.0.0.1:8080/
 
 ## 当前限制
 
-HTTP/1.1 only；`routes` 配置尚未实现；C 层 multipart 上传已实现（同步写盘，
-暂无 `filename*`/增量 SHA1/异步落盘）；SNI 不支持 IDN/多级通配；`tls.ciphers` 暂未应用。
+HTTP/1.1 only；`routes` 支持精确/前缀 + method + `kind=lua|upload`（变化需 restart），
+无 static/proxy/参数路由；C 层 multipart 上传已实现（同步写盘，暂无 `filename*`/增量 SHA1/
+异步落盘）；SNI 不支持 IDN/多级通配；`tls.ciphers` 暂未应用。
 多 worker（`server.workers > 1`）：
 listen/workers 数量/日志通道开关变化需 restart；证书链/CA 进程级共享，私钥与
 `ssl_config`/DRBG 每 worker 独立（mbedTLS 以 threading 支持构建）。

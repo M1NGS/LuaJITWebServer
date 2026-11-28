@@ -15,8 +15,8 @@
   客户端证书吊销表、固定格式异步日志、优雅退出
 
 当前版本支持 HTTP/1.1（含 keep-alive/pipeline）、HTTP/1.0 close 定界、请求体
-Content-Length 与 `Transfer-Encoding: chunked`、C 层 `multipart/form-data` 流式上传；
-不支持 HTTP/2 和 `routes` 配置（见第 12 节、第 18 节）。
+Content-Length 与 `Transfer-Encoding: chunked`、C 层 `multipart/form-data` 流式上传、
+启动时编译的简单 `routes` 表（精确/前缀/method/kind）；不支持 HTTP/2（见第 12、18 节）。
 
 ## 2. 总体架构
 
@@ -154,14 +154,21 @@ A/B 方式，避免阻塞事件循环。
 
 ## 7. Lua 运行时与分发
 
-- 初始化：`luaL_newstate` → `luaL_openlibs` → stream 辅助函数 → app/config。
+- 初始化：`luaL_newstate` → `luaL_openlibs` → stream 辅助函数 → config/app → routes。
+  `routes_parse` 把配置表里每项的 `path/method/prefix/kind` 编译进每 worker 的
+  `g_routes`，并把 `handler` 函数存成 registry ref（`g_route_refs`，`__thread`）；
+  第一个 worker 同时记录进程级启动快照供 control reload 校验。
 - 每请求：
   ```c
   lua_newthread(L); luaL_ref(L, REGISTRY);
-  lua_rawgeti(co, REGISTRY, app_ref);  // app table or handle function
+  ref = route_match(path, method) >= 0 ? route_refs[i] : app_ref;
+  lua_rawgeti(co, REGISTRY, ref);  // 命中路由或 app.handle fallback
   push req table; push res table;
   lua_resume(co, 2);
   ```
+- `kind="upload"` 的路由在 header 阶段检查 `req.multipart`，否则 415。
+- routes 只在启动时编译：SIGHUP reload 只比较新配置的定义与启动快照，变化则
+  `die("routes changes require restart")` 并回滚；app 重载不重建 routes。
 - `LUA_YIELD` 原因：`"read"` / `"drain"`，C pop 原因并记录等待状态。
 - `res:write_*` / `res:finish` / `res:queue_size` / `res:header_sent` / `res:set_timeout`
   是 C 闭包，upvalue 指向固定的 `request_t`。
@@ -434,6 +441,8 @@ libuv 没有内建优雅退出；`uv_stop` 只停止 loop。实现为应用层�
 
 - `server`：listen、tcp、tls、buffers、limits（C 消费）
 - `log`：三通道日志（file / otlp / syslog）；旧平铺 `log.access`/`log.error` 仍兼容并映射到 file
+- `routes`：启动时编译的路由数组（path/method/prefix/kind/handler 函数）；SIGHUP 只校验不变
+- `app`：业务模块路径或 handle 函数；`uploader` 等其余字段 C 不解释
 
 ### 13.1 配置结构（C 与 LuaJIT FFI 共用）
 
@@ -541,6 +550,7 @@ LuaJIT 是共享库，运行时需要 `LD_LIBRARY_PATH=prefix/luajit/lib`。
 | `tests/LLM/18_multiworker_reload_test.py` | 多 worker SIGHUP：app/日志路径/TLS 证书重载、拒绝变化 |
 | `tests/LLM/19_tls_shared_material_test.py` | 4 worker 共享证书材料：200 并发 TLS1.2/1.3 握手、reload 后代际并发 |
 | `tests/LLM/20_multipart_upload_test.py` | C 层 multipart：字段/文件、quoted boundary、chunked、软限、400/413、清理、keep-alive、4 worker 并发 |
+| `tests/LLM/21_routes_test.py` | routes 精确/前缀/method/上传 415/fallback、多 worker、reload 拒绝变化、启动校验 |
 | `tests/HUMAN/01_req_body_tristate_test.py` | body 三态语义（人工确认） |
 | `tests/HUMAN/02_shutdown_contract_test.py` | 优雅退出契约（人工确认） |
 | `bench/tests/pico_robust.py` | pico/luv 辅助服务器健壮性 |
@@ -577,11 +587,12 @@ WSL 抖动较大，历史数值仅作量级参考；当前版本未重新做完�
 - HTTP/1.1 only；无 HTTP/2
 - 请求体支持 Content-Length、`Transfer-Encoding: chunked`（仅单个 chunked coding）、
   C 层 multipart（同步写盘；无 `filename*`、增量 SHA1、异步落盘）
-- 无 `routes` 配置（路由在 app.lua 内自己判断）；`uploader` 只是透传业务配置
+- `routes` 只有精确/前缀 + method + `kind=lua|upload`，无正则/参数路由、static/proxy；
+  routes 变化需 restart（SIGHUP 拒绝并保留旧路由）
 - SNI 不支持 IDN/多级通配；`tls.ciphers` 未应用
 - 吊销表 provider 仅 mock；libpq native 待接
 - 吊销只影响新握手；不断开已建立连接；会话恢复不重新校验证书
 - CPU-bound handler 阻塞 loop，也会延迟优雅退出
 
-后续方向（`TODO.md`）：路由/uploader 配置、multipart P2（`filename*`/SHA1/异步写盘）、
+后续方向（`TODO.md`）：路由扩展（static/proxy/参数路由）、multipart P2（`filename*`/SHA1/异步写盘）、
 libpq native、`tls.ciphers`、HTTP/2、高并发握手线程池。

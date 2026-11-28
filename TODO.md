@@ -79,10 +79,17 @@ TLS 库选用 mbedTLS 3.6.8 LTS（源码构建、静态链接）。
 
 后续可选：`tls.ciphers`/`ciphersuites`、高并发握手线程池。
 
-## 3. 路由与 uploader 配置（下一步）
+## 3. 路由与 uploader 配置（P1 已完成 2026-11-29）
 
 `routes`（path/method/kind/handler）与 `uploader.uri` 等业务配置；C 编译路由表，
 handler 仍由 Lua 执行；`kind="upload"` 与 C 层 multipart 上传联动。
+
+已完成：顶层 `routes` 数组，每项 `{ path, method?, prefix?, kind?, handler }`；
+handler 是 config.lua 内联函数，启动时存成 registry ref（每 worker 独立）。
+精确/前缀匹配 + method 过滤；`kind="upload"` 强制 multipart（否则 415）；未命中回退
+`app.handle`。进程级启动快照用于 reload 校验：routes 变化 `requires restart`。
+测试 `tests/LLM/21_routes_test.py`（25 用例，含多 worker 和 app reload）。
+P2：`kind="static"/"proxy"`、参数/正则路由、routes 热重载。
 
 ## 4. 客户端证书吊销表（P1 mock 已完成，pgsql native 待接）
 
@@ -197,8 +204,9 @@ handler 仍由 Lua 执行；`kind="upload"` 与 C 层 multipart 上传联动。
 - [x] TLS 材料共享（2026-11-29）：共享只读 `mbedtls_x509_crt`/CA，`pk`/`conf`/DRBG 每 worker
   独立；测试 `19_tls_shared_material_test.py` 覆盖 4 worker × 200 并发握手与 reload 代际
   （见第 10 节；整代共享已因 `BAD_SIGNATURE` 否决）。
-- [ ] `routes`/`uploader` 配置（第 3 节）：先定格式（path/method/kind/handler），C 编译路由表，
-  Lua handler 绑定，`kind="upload"` 与 multipart 联动。
+- [x] `routes` 配置（2026-11-29，第 3 节）：path/method/prefix/kind/handler 内联函数，
+  未命中 app.handle，upload 路由强制 multipart；测试 `21_routes_test.py`。
+  剩 P2：static/proxy、参数路由、routes 热重载。
 - [x] C 层流式 multipart 上传（2026-11-29，第 1 节）：`tests/LLM/20_multipart_upload_test.py`；
   P2 剩 `filename*`/增量 SHA1/异步写盘。
 
